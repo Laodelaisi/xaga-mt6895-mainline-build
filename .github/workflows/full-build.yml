@@ -21,7 +21,7 @@ jobs:
       LOOP_IMG_PATH: "/pmos/rootfs.img"
 
     steps:
-      # ========== 1. 拉取源码（升级v5消除Node警告） ==========
+      # ========== 1. 拉取源码 ==========
       - name: Checkout 主线内核源码
         uses: actions/checkout@v5
         with:
@@ -36,10 +36,10 @@ jobs:
           repository: MT6895-Mainline/initramfs
           path: initramfs
 
-      # ========== 2. 安装依赖（修复clang-18 + 包名错误） ==========
-      - name: 添加 LLVM 官方源并安装完整工具链
+      # ========== 2. 安装依赖（修复mkbootimg） ==========
+      - name: 添加 LLVM 官方源 + 安装完整工具链
         run: |
-          # 添加LLVM 18官方APT仓库（适配Ubuntu 22.04 jammy）
+          # 添加LLVM 18官方APT仓库
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ env.CLANG_VER }} main" | sudo tee /etc/apt/sources.list.d/llvm.list
           
@@ -47,9 +47,14 @@ jobs:
           sudo apt install -y --no-install-recommends \
             build-essential bison flex libelf-dev libssl-dev cpio lz4 wget \
             clang-${{ env.CLANG_VER }} llvm-${{ env.CLANG_VER }} lld-${{ env.CLANG_VER }} \
-            device-tree-compiler python3-pip e2fsprogs f2fs-tools util-linux
-          
-          sudo pip3 install --break-system-packages mkbootimg
+            device-tree-compiler python3 f2fs-tools util-linux
+
+      - name: 安装 mkbootimg（osm0sis 通用版，修复pip安装失败）
+        run: |
+          sudo wget -O /usr/local/bin/mkbootimg https://raw.githubusercontent.com/osm0sis/mkbootimg/master/mkbootimg
+          sudo chmod +x /usr/local/bin/mkbootimg
+          # 验证安装
+          mkbootimg --help
 
       # ========== 3. 缓存优化 ==========
       - name: 内核编译缓存
@@ -113,7 +118,7 @@ jobs:
           make clean
           make BOOT_PARTITION="${{ env.PHYSICAL_ROOT_PART }}" LOOP_IMG="${{ env.LOOP_IMG_PATH }}"
           cp initramfs.cpio.lz4 ../initramfs-loop.cpio.lz4
-        continue-on-error: true  # 官方initramfs暂不支持LOOP参数时自动跳过，不中断主构建
+        continue-on-error: true
 
       # ========== 7. 处理 postmarketOS rootfs ==========
       - name: 下载 postmarketOS generic-aarch64 镜像
