@@ -1,0 +1,259 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      TASK:
+        description: "构建任务类型"
+        required: true
+        default: "全部(内核+RootFS)"
+        type: choice
+        options:
+          - "仅编译内核"
+          - "仅构建RootFS"
+          - "全部(内核+RootFS)"
+      ROOTFS_TYPE:
+        description: "RootFS发行版(仅RootFS任务生效)"
+        required: true
+        default: "postmarketOS"
+        type: choice
+        options:
+          - "postmarketOS"
+          - "Arch Linux ARM"
+          - "Ubuntu"
+      PMOS_UI:
+        description: "postmarketOS桌面环境(仅pmos生效)"
+        required: false
+        default: "phosh"
+        type: choice
+        options:
+          - "phosh"
+          - "none"
+          - "plasma-mobile"
+      CLANG_VERSION:
+        description: "LLVM Clang编译版本"
+        required: true
+        default: "18"
+        type: string
+
+env:
+  KERNEL_REPO: "MT6895-Mainline/linux"
+  KERNEL_BRANCH: "7.2-mt6895-xiaomi-xaga"
+  INITRAMFS_REPO: "MT6895-Mainline/initramfs"
+  PHYSICAL_ROOT_PART: "/dev/mmcblk0p86"
+  LOOP_IMG_PATH: "/pmos/rootfs.img"
+
+jobs:
+  # ============================================================
+  # Job 1: 编译 MT6895 主线 7.2 内核 (Clang + LLVM 全链路)
+  # ============================================================
+  kernel:
+    name: 编译主线内核
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.TASK != '仅构建RootFS' }}
+    steps:
+      - name: Checkout 本仓库(获取bot.py等工具)
+        uses: actions/checkout@v5
+
+      - name: 安装系统依赖 & LLVM 工具链
+        run: |
+          sudo apt update -y
+          sudo apt install -y --no-install-recommends \
+            build-essential bison flex libelf-dev libssl-dev cpio lz4 wget git \
+            device-tree-compiler f2fs-tools util-linux
+          # 添加 LLVM 官方源
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ inputs.CLANG_VERSION }} main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt update
+          sudo apt install -y clang-${{ inputs.CLANG_VERSION }} llvm-${{ inputs.CLANG_VERSION }} lld-${{ inputs.CLANG_VERSION }}
+
+      - name: 安装 osm0sis mkbootimg
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/mkbootimg.git
+          sudo cp mkbootimg/mkbootimg /usr/local/bin/
+          sudo chmod +x /usr/local/bin/mkbootimg
+
+      - name: 内核编译缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            kernel/.config
+            kernel/arch/arm64/boot
+            kernel/**/*.o
+            kernel/**/*.a
+          key: kernel-clang-${{ env.KERNEL_BRANCH }}-${{ github.sha }}
+          restore-keys: |
+            kernel-clang-${{ env.KERNEL_BRANCH }}-
+
+      - name: 拉取主线内核源码
+        run: |
+          if [ ! -d "kernel" ]; then
+            git clone --depth=0 -b ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel
+          fi
+
+      - name: 拉取项目专用 initramfs
+        run: |
+          git clone https://github.com/${{ env.INITRAMFS_REPO }}.git initramfs
+
+      - name: 加载平台 defconfig + 开启 Loop/F2FS
+        working-directory: kernel
+        run: |
+          cp arch/arm64/configs/xaga.config arch/arm64/configs/xaga_defconfig
+          make -j$(nproc) ARCH=arm64 CC=clang-${{ inputs.CLANG_VERSION }} LD=lld-${{ inputs.CLANG_VERSION }} xaga_defconfig
+          ./scripts/config --set-val CONFIG_BLK_DEV_LOOP y
+          ./scripts/config --set-val CONFIG_F2FS_FS y
+          ./scripts/config --set-val CONFIG_F2FS_STAT_FS y
+
+      - name: 全 LLVM 编译内核 (作者强制规范)
+        working-directory: kernel
+        run: |
+          make -j$(nproc) ARCH=arm64 CC=clang-${{ inputs.CLANG_VERSION }} LD=lld-${{ inputs.CLANG_VERSION }} LLVM=1 LLVM_IAS=1
+          # Image + DTB 拼接，绕过原厂LK dtbo限制
+          cat arch/arm64/boot/Image arch/arm64/boot/dts/mediatek/mt6895-xaga.dtb > Image_with_dtb
+          hexdump -C Image_with_dtb | grep d00dfeed
+
+      - name: 编译 initramfs (物理分区版)
+        working-directory: initramfs
+        run: |
+          make clean
+          make BOOT_PARTITION=${{ env.PHYSICAL_ROOT_PART }}
+          cp initramfs.cpio.lz4 ../initramfs-physical.cpio.lz4
+
+      - name: 打包 boot-physical.img
+        run: |
+          mkbootimg \
+            --kernel kernel/Image_with_dtb \
+            --ramdisk initramfs-physical.cpio.lz4 \
+            --cmdline "earlycon=0x11200000,115200 root=${{ env.PHYSICAL_ROOT_PART }} rootfstype=ext4 loglevel=7 PMOS_NOSPLASH" \
+            -o boot-physical.img
+
+      - name: 上传内核编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-output
+          path: |
+            boot-physical.img
+            kernel/Image_with_dtb
+            initramfs-physical.cpio.lz4
+
+  # ============================================================
+  # Job 2: 构建 RootFS (postmarketOS / Arch Linux ARM / Ubuntu)
+  # ============================================================
+  rootfs:
+    name: 构建RootFS
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.TASK != '仅编译内核' }}
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt update -y
+          sudo apt install -y --no-install-recommends wget git e2fsprogs util-linux
+
+      - name: RootFS 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            *.img
+            *.tar.gz
+          key: rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-${{ github.run_id }}
+          restore-keys: |
+            rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-
+
+      # ---------- postmarketOS ----------
+      - name: 构建 postmarketOS rootfs
+        if: ${{ inputs.ROOTFS_TYPE == 'postmarketOS' }}
+        run: |
+          PMOS_UI="${{ inputs.PMOS_UI }}"
+          URL="https://images.postmarketos.org/bpo/edge/generic-aarch64/${PMOS_UI}/postmarketos-${PMOS_UI}-generic-aarch64.img"
+          echo "下载: $URL"
+          wget -q --show-progress -O pmos-full.img "$URL"
+          # 挂载提取纯rootfs分区(去掉分区表和boot分区)
+          sudo losetup -P -f pmos-full.img
+          LOOP_DEV=$(sudo losetup -j pmos-full.img | cut -d: -f1)
+          echo "Loop设备: $LOOP_DEV"
+          sudo dd if=${LOOP_DEV}p2 of=pmos-rootfs.ext4 bs=4M status=progress
+          sudo losetup -d $LOOP_DEV
+          cp pmos-rootfs.ext4 rootfs.img
+          ls -lh rootfs.img
+
+      # ---------- Arch Linux ARM ----------
+      - name: 构建 Arch Linux ARM rootfs
+        if: ${{ inputs.ROOTFS_TYPE == 'Arch Linux ARM' }}
+        run: |
+          URL="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+          echo "下载: $URL"
+          wget -q --show-progress -O ArchLinuxARM-aarch64.tar.gz "$URL"
+          # 创建4G ext4镜像
+          dd if=/dev/zero of=rootfs.img bs=1M count=4096 status=progress
+          mkfs.ext4 -F rootfs.img
+          # 挂载并解压
+          mkdir -p rootfs_mnt
+          sudo mount -o loop rootfs.img rootfs_mnt
+          sudo tar -xzf ArchLinuxARM-aarch64.tar.gz -C rootfs_mnt
+          sudo umount rootfs_mnt
+          rmdir rootfs_mnt
+          ls -lh rootfs.img
+
+      # ---------- Ubuntu ----------
+      - name: 构建 Ubuntu rootfs
+        if: ${{ inputs.ROOTFS_TYPE == 'Ubuntu' }}
+        run: |
+          URL="https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.2-base-arm64.tar.gz"
+          echo "下载: $URL"
+          wget -q --show-progress -O ubuntu-base-arm64.tar.gz "$URL"
+          # 创建4G ext4镜像
+          dd if=/dev/zero of=rootfs.img bs=1M count=4096 status=progress
+          mkfs.ext4 -F rootfs.img
+          # 挂载并解压
+          mkdir -p rootfs_mnt
+          sudo mount -o loop rootfs.img rootfs_mnt
+          sudo tar -xzf ubuntu-base-arm64.tar.gz -C rootfs_mnt
+          sudo umount rootfs_mnt
+          rmdir rootfs_mnt
+          ls -lh rootfs.img
+
+      - name: 上传 RootFS 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-output
+          path: |
+            rootfs.img
+
+  # ============================================================
+  # Job 3: 编译完成通知 (钉钉 / Server酱)
+  # ============================================================
+  notify:
+    name: 发送构建通知
+    runs-on: ubuntu-latest
+    needs: [kernel, rootfs]
+    if: always()
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v5
+
+      - name: 判定整体构建状态
+        id: status
+        run: |
+          KERNEL_RESULT="${{ needs.kernel.result }}"
+          ROOTFS_RESULT="${{ needs.rootfs.result }}"
+          echo "内核Job: $KERNEL_RESULT"
+          echo "RootFS Job: $ROOTFS_RESULT"
+          # 任一失败则整体失败
+          if [[ "$KERNEL_RESULT" == "failure" || "$ROOTFS_RESULT" == "failure" ]]; then
+            echo "result=failure" >> $GITHUB_OUTPUT
+          else
+            echo "result=success" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 调用 bot.py 发送通知
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pip3 install --quiet requests 2>/dev/null || true
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python3 bot.py --notify \
+            --status ${{ steps.status.outputs.result }} \
+            --artifact-url "$RUN_URL"
