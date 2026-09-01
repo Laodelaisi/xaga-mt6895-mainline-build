@@ -67,11 +67,14 @@ jobs:
           sudo apt update
           sudo apt install -y clang-${{ inputs.CLANG_VERSION }} llvm-${{ inputs.CLANG_VERSION }} lld-${{ inputs.CLANG_VERSION }}
 
-      - name: 安装 osm0sis mkbootimg
+      - name: 安装 osm0sis mkbootimg (C源码, 需make编译)
         run: |
           git clone --depth=1 https://github.com/osm0sis/mkbootimg.git
-          sudo cp mkbootimg/mkbootimg /usr/local/bin/
+          cd mkbootimg
+          make
+          sudo cp mkbootimg /usr/local/bin/
           sudo chmod +x /usr/local/bin/mkbootimg
+          mkbootimg --help
 
       - name: 内核编译缓存
         uses: actions/cache@v4
@@ -155,25 +158,51 @@ jobs:
           path: |
             *.img
             *.tar.gz
+            ~/.local/var/pmbootstrap/cache_apk
           key: rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-${{ github.run_id }}
           restore-keys: |
             rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-
 
-      # ---------- postmarketOS ----------
-      - name: 构建 postmarketOS rootfs
+      # ---------- postmarketOS (pmbootstrap本地构建, 官方已下架generic-aarch64预构建镜像) ----------
+      - name: 构建 postmarketOS rootfs (pmbootstrap)
         if: ${{ inputs.ROOTFS_TYPE == 'postmarketOS' }}
         run: |
+          # 安装 pmbootstrap 运行依赖
+          sudo apt install -y --no-install-recommends qemu-user-static binfmt-support python3-pip
+          pip3 install --break-system-packages pmbootstrap
+
           PMOS_UI="${{ inputs.PMOS_UI }}"
-          URL="https://images.postmarketos.org/bpo/edge/generic-aarch64/${PMOS_UI}/postmarketos-${PMOS_UI}-generic-aarch64.img"
-          echo "下载: $URL"
-          wget -q --show-progress -O pmos-full.img "$URL"
-          # 挂载提取纯rootfs分区(去掉分区表和boot分区)
-          sudo losetup -P -f pmos-full.img
-          LOOP_DEV=$(sudo losetup -j pmos-full.img | cut -d: -f1)
-          echo "Loop设备: $LOOP_DEV"
-          sudo dd if=${LOOP_DEV}p2 of=pmos-rootfs.ext4 bs=4M status=progress
+          echo "使用 pmbootstrap 构建 generic-aarch64, UI=${PMOS_UI}"
+
+          # 非交互初始化: work目录默认 -> vendor=generic -> device=generic-aarch64 -> kernel=mainline -> ui -> channel=edge -> 其余默认
+          printf '\ngeneric\ngeneric-aarch64\nmainline\n%s\nedge\n\n\n\n\n\n\n\n\n\n' "${PMOS_UI}" | pmbootstrap init
+
+          # 构建 rootfs, --no-kernel 不打包pmOS自带内核(使用我们自己编译的主线内核)
+          pmbootstrap install --no-kernel --filesystem ext4
+
+          # 定位生成的镜像文件
+          PMOS_IMG=$(ls -t ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/generic-aarch64*.img 2>/dev/null | head -1)
+          if [ -z "$PMOS_IMG" ]; then
+            echo "错误: 未找到生成的pmOS镜像"
+            ls -la ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "生成镜像: $PMOS_IMG"
+
+          # 提取纯 rootfs 分区(去掉分区表和boot分区)
+          sudo losetup -P -f "$PMOS_IMG"
+          LOOP_DEV=$(sudo losetup -j "$PMOS_IMG" | cut -d: -f1)
+          echo "Loop设备: $LOOP_DEV, 分区列表:"
+          ls ${LOOP_DEV}p* 2>/dev/null || true
+          # 优先取p2(rootfs), 其次p1, 最后整个设备
+          if [ -e "${LOOP_DEV}p2" ]; then
+            sudo dd if=${LOOP_DEV}p2 of=rootfs.img bs=4M status=progress
+          elif [ -e "${LOOP_DEV}p1" ]; then
+            sudo dd if=${LOOP_DEV}p1 of=rootfs.img bs=4M status=progress
+          else
+            sudo dd if=${LOOP_DEV} of=rootfs.img bs=4M status=progress
+          fi
           sudo losetup -d $LOOP_DEV
-          cp pmos-rootfs.ext4 rootfs.img
           ls -lh rootfs.img
 
       # ---------- Arch Linux ARM ----------
