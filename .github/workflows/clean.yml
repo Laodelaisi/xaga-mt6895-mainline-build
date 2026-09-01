@@ -1,0 +1,39 @@
+name: Clean Cache
+
+on:
+  workflow_dispatch:
+
+jobs:
+  clean:
+    name: 清空全部Actions缓存
+    runs-on: ubuntu-latest
+    steps:
+      - name: 删除所有缓存条目
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            console.log(`开始清理 ${owner}/${repo} 的 Actions 缓存...`);
+            let total = 0;
+            let page = 1;
+            while (true) {
+              const { data } = await github.rest.actions.getActionsCacheList({
+                owner, repo, per_page: 100, page
+              });
+              const caches = data.actions_caches || [];
+              if (caches.length === 0) break;
+              for (const cache of caches) {
+                try {
+                  await github.rest.actions.deleteActionsCacheById({
+                    owner, repo, cache_id: cache.id
+                  });
+                  console.log(`  已删除: [${cache.id}] ${cache.key} (${(cache.size_in_bytes / 1024 / 1024).toFixed(1)} MB)`);
+                  total++;
+                } catch (e) {
+                  console.log(`  跳过: ${cache.key} - ${e.message}`);
+                }
+              }
+              page++;
+              if (caches.length < 100) break;
+            }
+            console.log(`\n清理完成，共删除 ${total} 条缓存。`);
