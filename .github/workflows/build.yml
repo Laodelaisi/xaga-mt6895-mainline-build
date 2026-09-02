@@ -67,10 +67,12 @@ jobs:
           sudo apt update
           sudo apt install -y clang-${{ inputs.CLANG_VERSION }} llvm-${{ inputs.CLANG_VERSION }} lld-${{ inputs.CLANG_VERSION }}
 
-      - name: 安装 osm0sis mkbootimg (C源码, 需make编译)
+      - name: 安装 osm0sis mkbootimg (C源码, 需make编译, 去掉-Werror兼容新GCC)
         run: |
           git clone --depth=1 https://github.com/osm0sis/mkbootimg.git
           cd mkbootimg
+          # Ubuntu 24.04 GCC13/14 下 libmincrypt/rsa.c 触发 stringop-overflow 误报, 去掉-Werror
+          sed -i 's/-Werror//g' Makefile libmincrypt/Makefile
           make
           sudo cp mkbootimg /usr/local/bin/
           sudo chmod +x /usr/local/bin/mkbootimg
@@ -167,9 +169,10 @@ jobs:
       - name: 构建 postmarketOS rootfs (pmbootstrap)
         if: ${{ inputs.ROOTFS_TYPE == 'postmarketOS' }}
         run: |
-          # 安装 pmbootstrap 运行依赖
+          # 安装 pmbootstrap (PyPI已下架, 从官方gitlab仓库安装)
           sudo apt install -y --no-install-recommends qemu-user-static binfmt-support python3-pip
-          pip3 install --break-system-packages pmbootstrap
+          git clone --depth=1 https://gitlab.com/postmarketOS/pmbootstrap.git
+          pip3 install --break-system-packages ./pmbootstrap
 
           PMOS_UI="${{ inputs.PMOS_UI }}"
           echo "使用 pmbootstrap 构建 generic-aarch64, UI=${PMOS_UI}"
