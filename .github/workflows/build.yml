@@ -35,6 +35,15 @@ on:
         required: true
         default: "18"
         type: string
+      UBUNTU_VERSION:
+        description: "Ubuntu版本(仅Ubuntu RootFS生效)"
+        required: true
+        default: "26.04 LTS"
+        type: choice
+        options:
+          - "26.04 LTS"
+          - "25.10"
+          - "24.04 LTS"
 
 env:
   KERNEL_REPO: "MT6895-Mainline/linux"
@@ -76,7 +85,8 @@ jobs:
           make
           sudo cp mkbootimg /usr/local/bin/
           sudo chmod +x /usr/local/bin/mkbootimg
-          mkbootimg --help
+          # osm0sis版mkbootimg不支持--help, 不带参数即输出usage验证安装
+          mkbootimg 2>&1 | head -3
 
       - name: 内核编译缓存
         uses: actions/cache@v4
@@ -169,9 +179,9 @@ jobs:
       - name: 构建 postmarketOS rootfs (pmbootstrap)
         if: ${{ inputs.ROOTFS_TYPE == 'postmarketOS' }}
         run: |
-          # 安装 pmbootstrap (PyPI已下架, 从官方gitlab仓库安装)
+          # 安装 pmbootstrap (PyPI已下架, 从官方自建gitlab安装, 已从gitlab.com迁移)
           sudo apt install -y --no-install-recommends qemu-user-static binfmt-support python3-pip
-          git clone --depth=1 https://gitlab.com/postmarketOS/pmbootstrap.git
+          git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
           pip3 install --break-system-packages ./pmbootstrap
 
           PMOS_UI="${{ inputs.PMOS_UI }}"
@@ -226,11 +236,25 @@ jobs:
           rmdir rootfs_mnt
           ls -lh rootfs.img
 
-      # ---------- Ubuntu ----------
-      - name: 构建 Ubuntu rootfs
+      # ---------- Ubuntu (可选择版本, 动态探测最新补丁版) ----------
+      - name: 构建 Ubuntu rootfs (动态版本探测)
         if: ${{ inputs.ROOTFS_TYPE == 'Ubuntu' }}
         run: |
-          URL="https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.2-base-arm64.tar.gz"
+          UBUNTU_VER="${{ inputs.UBUNTU_VERSION }}"
+          # 去掉 " LTS" 后缀, 提取纯版本号 (如 "26.04 LTS" -> "26.04")
+          VER_NUM=$(echo "$UBUNTU_VER" | sed 's/ LTS//')
+          echo "选择 Ubuntu 版本: $UBUNTU_VER (纯版本号: $VER_NUM)"
+
+          # 动态探测该版本目录下最新的 arm64 ubuntu-base tar.gz (自动匹配 26.04 / 26.04.1 等补丁版)
+          BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${VER_NUM}/release"
+          echo "探测目录: $BASE_URL"
+          FILENAME=$(curl -s "$BASE_URL/" | grep -oE "ubuntu-base-${VER_NUM}[^\"']*base-arm64\.tar\.gz" | sort -V | tail -1)
+          if [ -z "$FILENAME" ]; then
+            echo "错误: 未找到 Ubuntu ${VER_NUM} 的 arm64 镜像, 目录内容:"
+            curl -s "$BASE_URL/" | grep -oE 'ubuntu-base-[^"]*arm64[^"]*\.tar\.gz' | head -10
+            exit 1
+          fi
+          URL="${BASE_URL}/${FILENAME}"
           echo "下载: $URL"
           wget -q --show-progress -O ubuntu-base-arm64.tar.gz "$URL"
           # 创建4G ext4镜像
