@@ -11,7 +11,7 @@ Initramfs: [MT6895-Mainline/initramfs](https://github.com/MT6895-Mainline/initra
 xaga-mt6895-mainline-build/
 ├── .github/
 │   └── workflows/
-│       ├── Build.yml    # 主编译工作流 (内核编译 + RootFS构建 + 完成通知)
+│       ├── build.yml    # 主编译工作流 (内核编译 + RootFS构建 + 完成通知)
 │       └── clean.yml    # 缓存清理工作流
 ├── bot.py               # 自动化助手 (钉钉/Server酱通知 + 上游更新检测 + 自动触发构建)
 └── README.md
