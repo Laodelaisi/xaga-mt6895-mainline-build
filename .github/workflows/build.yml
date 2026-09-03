@@ -1,12 +1,11 @@
 name: Build
 on:
-  # 只保留网页手动触发，移除push / pull_request，代码提交不会自动构建
   workflow_dispatch:
     inputs:
       TASK:
-        description: "构建任务类型"
+        description: "构建任务类型【调试内核请选：仅编译内核，节省CI时间】"
         required: true
-        default: "全部(内核+RootFS)"
+        default: "仅编译内核"
         type: choice
         options:
           - "仅编译内核"
@@ -64,6 +63,7 @@ jobs:
   kernel:
     name: 编译主线内核
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     if: ${{ github.event.inputs.TASK != '仅构建RootFS' }}
     steps:
       - name: Checkout 本仓库(获取bot.py等工具)
@@ -85,25 +85,24 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/osm0sis/mkbootimg.git
           cd mkbootimg
-          # Ubuntu 24.04 GCC13/14 下 libmincrypt/rsa.c 触发 stringop-overflow 误报, 去掉-Werror
           sed -i 's/-Werror//g' Makefile libmincrypt/Makefile
           make
           sudo cp mkbootimg /usr/local/bin/
           sudo chmod +x /usr/local/bin/mkbootimg
-          # osm0sis版mkbootimg不支持--help, 不带参数即输出usage验证安装
           mkbootimg 2>&1 | head -3
 
-      - name: 内核编译缓存
-        uses: actions/cache@v4
-        with:
-          path: |
-            kernel/.config
-            kernel/arch/arm64/boot
-            kernel/**/*.o
-            kernel/**/*.a
-          key: kernel-clang-${{ env.KERNEL_BRANCH }}-${{ github.sha }}
-          restore-keys: |
-            kernel-clang-${{ env.KERNEL_BRANCH }}-
+      # ============ 调试阶段建议注释cache，节约存储配额 ============
+      # - name: 内核编译缓存
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       kernel/.config
+      #       kernel/arch/arm64/boot
+      #       kernel/**/*.o
+      #       kernel/**/*.a
+      #     key: kernel-clang-${{ env.KERNEL_BRANCH }}-${{ github.sha }}
+      #     restore-keys: |
+      #       kernel-clang-${{ env.KERNEL_BRANCH }}-
 
       - name: 拉取主线内核源码
         run: |
@@ -119,7 +118,7 @@ jobs:
         working-directory: kernel
         run: |
           cp arch/arm64/configs/xaga.config arch/arm64/configs/xaga_defconfig
-          # defconfig阶段仅传入ARCH，禁止传入CC/LD，避免Kconfig链接器校验报错
+          # defconfig仅传ARCH，禁止传入CC/LD，防止Kconfig链接器校验报错
           make ARCH=arm64 xaga_defconfig
           ./scripts/config --set-val CONFIG_BLK_DEV_LOOP y
           ./scripts/config --set-val CONFIG_F2FS_FS y
@@ -128,7 +127,11 @@ jobs:
       - name: 全 LLVM 编译内核 (作者强制规范)
         working-directory: kernel
         run: |
-          make -j$(nproc) ARCH=arm64 CC=clang-${{ inputs.CLANG_VERSION }} LD=lld-${{ inputs.CLANG_VERSION }} LLVM=1 LLVM_IAS=1
+          # 【修复】LD必须为ld.lld‑XX，不是lld‑XX
+          make -j$(nproc) ARCH=arm64 \
+            CC=clang-${{ inputs.CLANG_VERSION }} \
+            LD=ld.lld-${{ inputs.CLANG_VERSION }} \
+            LLVM=1 LLVM_IAS=1
           # Image + DTB 拼接，绕过原厂LK dtbo限制
           cat arch/arm64/boot/Image arch/arm64/boot/dts/mediatek/mt6895-xaga.dtb > Image_with_dtb
           hexdump -C Image_with_dtb | grep d00dfeed
@@ -145,7 +148,7 @@ jobs:
           mkbootimg \
             --kernel kernel/Image_with_dtb \
             --ramdisk initramfs-physical.cpio.lz4 \
-            --cmdline "earlycon=0x11200000,115200 root=${{ env.PHYSICAL_ROOT_PART }} rootfstype=ext4 loglevel=7 PMOS_NOSPLASH" \
+            --cmdline "earlycon=0x11200000,115200 root=${{ env.PHYSICAL_ROOT_PART }} rootfstype=ext4 loglevel=7 PMOS_NOSPLASH mem=6G" \
             -o boot-physical.img
 
       - name: 上传内核编译产物
@@ -163,6 +166,7 @@ jobs:
   rootfs:
     name: 构建RootFS
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     if: ${{ github.event.inputs.TASK != '仅编译内核' }}
     steps:
       - name: 安装依赖
@@ -170,45 +174,31 @@ jobs:
           sudo apt update -y
           sudo apt install -y --no-install-recommends wget git e2fsprogs util-linux
 
-      - name: RootFS 缓存
-        uses: actions/cache@v4
-        with:
-          path: |
-            *.img
-            *.tar.gz
-            ~/.local/var/pmbootstrap/cache_apk
-          key: rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-${{ github.run_id }}
-          restore-keys: |
-            rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-
+      # ============ 调试阶段注释cache，节约存储 ============
+      # - name: RootFS 缓存
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       *.img
+      #       *.tar.gz
+      #       ~/.local/var/pmbootstrap/cache_apk
+      #     key: rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-${{ github.run_id }}
+      #     restore-keys: |
+      #       rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-
 
-      # ---------- postmarketOS (pmbootstrap本地构建, 官方已下架generic-aarch64预构建镜像) ----------
       - name: 构建 postmarketOS rootfs (pmbootstrap)
         if: ${{ inputs.ROOTFS_TYPE == 'postmarketOS' }}
         run: |
-          # 安装 pmbootstrap (PyPI已下架, 从官方自建gitlab安装, 已从gitlab.com迁移)
           sudo apt install -y --no-install-recommends qemu-user-static binfmt-support python3-pip
           git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
           pip3 install --break-system-packages ./pmbootstrap
           PMOS_UI="${{ inputs.PMOS_UI }}"
-          echo "使用 pmbootstrap 构建 generic-aarch64, UI=${PMOS_UI}"
-          # 非交互初始化: work目录默认 -> vendor=generic -> device=generic-aarch64 -> kernel=mainline -> ui -> channel=edge -> 其余默认
           printf '\ngeneric\ngeneric-aarch64\nmainline\n%s\nedge\n\n\n\n\n\n\n\n\n\n' "${PMOS_UI}" | pmbootstrap init
-          # 构建 rootfs, --no-kernel 不打包pmOS自带内核(使用我们自己编译的主线内核)
           pmbootstrap install --no-kernel --filesystem ext4
-          # 定位生成的镜像文件
           PMOS_IMG=$(ls -t ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/generic-aarch64*.img 2>/dev/null | head -1)
-          if [ -z "$PMOS_IMG" ]; then
-            echo "错误: 未找到生成的pmOS镜像"
-            ls -la ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/ 2>/dev/null || true
-            exit 1
-          fi
-          echo "生成镜像: $PMOS_IMG"
-          # 提取纯 rootfs 分区(去掉分区表和boot分区)
+          if [ -z "$PMOS_IMG" ]; then echo "错误: 未找到pmOS镜像"; exit 1; fi
           sudo losetup -P -f "$PMOS_IMG"
           LOOP_DEV=$(sudo losetup -j "$PMOS_IMG" | cut -d: -f1)
-          echo "Loop设备: $LOOP_DEV, 分区列表:"
-          ls ${LOOP_DEV}p* 2>/dev/null || true
-          # 优先取p2(rootfs), 其次p1, 最后整个设备
           if [ -e "${LOOP_DEV}p2" ]; then
             sudo dd if=${LOOP_DEV}p2 of=rootfs.img bs=4M status=progress
           elif [ -e "${LOOP_DEV}p1" ]; then
@@ -217,56 +207,37 @@ jobs:
             sudo dd if=${LOOP_DEV} of=rootfs.img bs=4M status=progress
           fi
           sudo losetup -d $LOOP_DEV
-          ls -lh rootfs.img
 
-      # ---------- Arch Linux ARM ----------
       - name: 构建 Arch Linux ARM rootfs
         if: ${{ inputs.ROOTFS_TYPE == 'Arch Linux ARM' }}
         run: |
           URL="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
-          echo "下载: $URL"
           wget -q --show-progress -O ArchLinuxARM-aarch64.tar.gz "$URL"
-          # 创建4G ext4镜像
           dd if=/dev/zero of=rootfs.img bs=1M count=4096 status=progress
           mkfs.ext4 -F rootfs.img
-          # 挂载并解压
           mkdir -p rootfs_mnt
           sudo mount -o loop rootfs.img rootfs_mnt
           sudo tar -xzf ArchLinuxARM-aarch64.tar.gz -C rootfs_mnt
           sudo umount rootfs_mnt
           rmdir rootfs_mnt
-          ls -lh rootfs.img
 
-      # ---------- Ubuntu (可选择版本, 动态探测最新补丁版) ----------
       - name: 构建 Ubuntu rootfs (动态版本探测)
         if: ${{ inputs.ROOTFS_TYPE == 'Ubuntu' }}
         run: |
           UBUNTU_VER="${{ inputs.UBUNTU_VERSION }}"
-          # 去掉 " LTS" 后缀, 提取纯版本号 (如 "26.04 LTS" -> "26.04")
           VER_NUM=$(echo "$UBUNTU_VER" | sed 's/ LTS//')
-          echo "选择 Ubuntu 版本: $UBUNTU_VER (纯版本号: $VER_NUM)"
-          # 动态探测该版本目录下最新的 arm64 ubuntu-base tar.gz (自动匹配 26.04 / 26.04.1 等补丁版)
           BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${VER_NUM}/release"
-          echo "探测目录: $BASE_URL"
           FILENAME=$(curl -s "$BASE_URL/" | grep -oE "ubuntu-base-${VER_NUM}[^\"']*base-arm64\.tar\.gz" | sort -V | tail -1)
-          if [ -z "$FILENAME" ]; then
-            echo "错误: 未找到 Ubuntu ${VER_NUM} 的 arm64 镜像, 目录内容:"
-            curl -s "$BASE_URL/" | grep -oE 'ubuntu-base-[^"]*arm64[^"]*\.tar\.gz' | head -10
-            exit 1
-          fi
+          if [ -z "$FILENAME" ]; then echo "错误:找不到Ubuntu镜像"; exit 1; fi
           URL="${BASE_URL}/${FILENAME}"
-          echo "下载: $URL"
           wget -q --show-progress -O ubuntu-base-arm64.tar.gz "$URL"
-          # 创建4G ext4镜像
           dd if=/dev/zero of=rootfs.img bs=1M count=4096 status=progress
           mkfs.ext4 -F rootfs.img
-          # 挂载并解压
           mkdir -p rootfs_mnt
           sudo mount -o loop rootfs.img rootfs_mnt
           sudo tar -xzf ubuntu-base-arm64.tar.gz -C rootfs_mnt
           sudo umount rootfs_mnt
           rmdir rootfs_mnt
-          ls -lh rootfs.img
 
       - name: 上传 RootFS 产物
         uses: actions/upload-artifact@v4
@@ -292,13 +263,10 @@ jobs:
         run: |
           KERNEL_RESULT="${{ needs.kernel.result }}"
           ROOTFS_RESULT="${{ needs.rootfs.result }}"
-          echo "内核Job: $KERNEL_RESULT"
-          echo "RootFS Job: $ROOTFS_RESULT"
           overall="success"
           if [[ "$KERNEL_RESULT" == "failure" ]]; then
             overall="failure"
           fi
-          # rootfs为skipped代表任务没有执行，不计入失败
           if [[ "$ROOTFS_RESULT" != "skipped" && "$ROOTFS_RESULT" == "failure" ]]; then
             overall="failure"
           fi
@@ -309,7 +277,6 @@ jobs:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           pip3 install --quiet requests 2>/dev/null || true
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
