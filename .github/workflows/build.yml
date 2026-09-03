@@ -69,11 +69,11 @@ jobs:
       - name: Checkout 本仓库(获取bot.py等工具)
         uses: actions/checkout@v5
 
-      - name: 安装系统依赖 & LLVM 工具链 + 创建llvm无版本软链接
+      - name: 安装系统依赖 & LLVM 工具链 + ccache + 创建llvm无版本软链接
         run: |
           sudo apt update -y
           sudo apt install -y --no-install-recommends \
-            build-essential bison flex libelf-dev libssl-dev cpio lz4 wget git \
+            build-essential bison flex libelf-dev libssl-dev cpio lz4 wget git ccache \
             device-tree-compiler f2fs-tools util-linux
           # 添加 LLVM 官方源
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
@@ -81,21 +81,26 @@ jobs:
           sudo apt update
           sudo apt install -y clang-${{ inputs.CLANG_VERSION }} llvm-${{ inputs.CLANG_VERSION }} lld-${{ inputs.CLANG_VERSION }}
 
-          # 创建不带版本后缀符号链接，修复 LLVM=1 模式下 llvm‑nm / llvm‑objcopy / llvm‑readelf not found
+          # 创建不带版本后缀符号链接，修复 LLVM=1 模式下各类工具 not found
           CLANG_VER=${{ inputs.CLANG_VERSION }}
           sudo ln -sf /usr/bin/clang-${CLANG_VER} /usr/bin/clang
           sudo ln -sf /usr/bin/clang++-${CLANG_VER} /usr/bin/clang++
           sudo ln -sf /usr/bin/lld-${CLANG_VER} /usr/bin/lld
           sudo ln -sf /usr/bin/ld.lld-${CLANG_VER} /usr/bin/ld.lld
+          sudo ln -sf /usr/bin/llvm-ar-${CLANG_VER} /usr/bin/llvm-ar
           sudo ln -sf /usr/bin/llvm-nm-${CLANG_VER} /usr/bin/llvm-nm
           sudo ln -sf /usr/bin/llvm-objcopy-${CLANG_VER} /usr/bin/llvm-objcopy
           sudo ln -sf /usr/bin/llvm-readelf-${CLANG_VER} /usr/bin/llvm-readelf
           sudo ln -sf /usr/bin/llvm-strip-${CLANG_VER} /usr/bin/llvm-strip
 
-          # 校验工具是否正常
-          llvm-readelf --version
+          # 全部工具校验
+          llvm-ar --version
           llvm-nm --version
           llvm-objcopy --version
+          llvm-readelf --version
+          llvm-strip --version
+          ccache -M ${CCACHE_MAXSIZE}
+          ccache -z
 
       - name: 安装 osm0sis mkbootimg (C源码, 需make编译, 去掉‑Werror兼容新GCC)
         run: |
