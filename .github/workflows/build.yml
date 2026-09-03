@@ -1,5 +1,4 @@
 name: Build
-
 on:
   workflow_dispatch:
     inputs:
@@ -44,6 +43,11 @@ on:
           - "26.04 LTS"
           - "25.10"
           - "24.04 LTS"
+      ENABLE_NOTIFY:
+        description: "开启钉钉/Server酱构建通知"
+        required: false
+        default: true
+        type: boolean
 
 env:
   KERNEL_REPO: "MT6895-Mainline/linux"
@@ -103,7 +107,7 @@ jobs:
       - name: 拉取主线内核源码
         run: |
           if [ ! -d "kernel" ]; then
-            git clone --depth=0 -b ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel
+            git clone -b ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel
           fi
 
       - name: 拉取项目专用 initramfs
@@ -183,16 +187,12 @@ jobs:
           sudo apt install -y --no-install-recommends qemu-user-static binfmt-support python3-pip
           git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
           pip3 install --break-system-packages ./pmbootstrap
-
           PMOS_UI="${{ inputs.PMOS_UI }}"
           echo "使用 pmbootstrap 构建 generic-aarch64, UI=${PMOS_UI}"
-
           # 非交互初始化: work目录默认 -> vendor=generic -> device=generic-aarch64 -> kernel=mainline -> ui -> channel=edge -> 其余默认
           printf '\ngeneric\ngeneric-aarch64\nmainline\n%s\nedge\n\n\n\n\n\n\n\n\n\n' "${PMOS_UI}" | pmbootstrap init
-
           # 构建 rootfs, --no-kernel 不打包pmOS自带内核(使用我们自己编译的主线内核)
           pmbootstrap install --no-kernel --filesystem ext4
-
           # 定位生成的镜像文件
           PMOS_IMG=$(ls -t ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/generic-aarch64*.img 2>/dev/null | head -1)
           if [ -z "$PMOS_IMG" ]; then
@@ -201,7 +201,6 @@ jobs:
             exit 1
           fi
           echo "生成镜像: $PMOS_IMG"
-
           # 提取纯 rootfs 分区(去掉分区表和boot分区)
           sudo losetup -P -f "$PMOS_IMG"
           LOOP_DEV=$(sudo losetup -j "$PMOS_IMG" | cut -d: -f1)
@@ -244,7 +243,6 @@ jobs:
           # 去掉 " LTS" 后缀, 提取纯版本号 (如 "26.04 LTS" -> "26.04")
           VER_NUM=$(echo "$UBUNTU_VER" | sed 's/ LTS//')
           echo "选择 Ubuntu 版本: $UBUNTU_VER (纯版本号: $VER_NUM)"
-
           # 动态探测该版本目录下最新的 arm64 ubuntu-base tar.gz (自动匹配 26.04 / 26.04.1 等补丁版)
           BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${VER_NUM}/release"
           echo "探测目录: $BASE_URL"
@@ -282,7 +280,7 @@ jobs:
     name: 发送构建通知
     runs-on: ubuntu-latest
     needs: [kernel, rootfs]
-    if: always()
+    if: ${{ always() && inputs.ENABLE_NOTIFY }}
     steps:
       - name: Checkout 本仓库
         uses: actions/checkout@v5
@@ -294,12 +292,15 @@ jobs:
           ROOTFS_RESULT="${{ needs.rootfs.result }}"
           echo "内核Job: $KERNEL_RESULT"
           echo "RootFS Job: $ROOTFS_RESULT"
-          # 任一失败则整体失败
-          if [[ "$KERNEL_RESULT" == "failure" || "$ROOTFS_RESULT" == "failure" ]]; then
-            echo "result=failure" >> $GITHUB_OUTPUT
-          else
-            echo "result=success" >> $GITHUB_OUTPUT
+          overall="success"
+          if [[ "$KERNEL_RESULT" == "failure" ]]; then
+            overall="failure"
           fi
+          # rootfs为skipped代表任务没有执行，不计入失败
+          if [[ "$ROOTFS_RESULT" != "skipped" && "$ROOTFS_RESULT" == "failure" ]]; then
+            overall="failure"
+          fi
+          echo "result=${overall}" >> $GITHUB_OUTPUT
 
       - name: 调用 bot.py 发送通知
         env:
