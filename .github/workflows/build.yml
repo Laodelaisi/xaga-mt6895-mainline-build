@@ -69,7 +69,7 @@ jobs:
       - name: Checkout 本仓库(获取bot.py等工具)
         uses: actions/checkout@v5
 
-      - name: 安装系统依赖 & LLVM 工具链
+      - name: 安装系统依赖 & LLVM 工具链 + 创建llvm无版本软链接
         run: |
           sudo apt update -y
           sudo apt install -y --no-install-recommends \
@@ -81,7 +81,23 @@ jobs:
           sudo apt update
           sudo apt install -y clang-${{ inputs.CLANG_VERSION }} llvm-${{ inputs.CLANG_VERSION }} lld-${{ inputs.CLANG_VERSION }}
 
-      - name: 安装 osm0sis mkbootimg (C源码, 需make编译, 去掉-Werror兼容新GCC)
+          # 创建不带版本后缀符号链接，修复 LLVM=1 模式下 llvm‑nm / llvm‑objcopy / llvm‑readelf not found
+          CLANG_VER=${{ inputs.CLANG_VERSION }}
+          sudo ln -sf /usr/bin/clang-${CLANG_VER} /usr/bin/clang
+          sudo ln -sf /usr/bin/clang++-${CLANG_VER} /usr/bin/clang++
+          sudo ln -sf /usr/bin/lld-${CLANG_VER} /usr/bin/lld
+          sudo ln -sf /usr/bin/ld.lld-${CLANG_VER} /usr/bin/ld.lld
+          sudo ln -sf /usr/bin/llvm-nm-${CLANG_VER} /usr/bin/llvm-nm
+          sudo ln -sf /usr/bin/llvm-objcopy-${CLANG_VER} /usr/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/llvm-readelf-${CLANG_VER} /usr/bin/llvm-readelf
+          sudo ln -sf /usr/bin/llvm-strip-${CLANG_VER} /usr/bin/llvm-strip
+
+          # 校验工具是否正常
+          llvm-readelf --version
+          llvm-nm --version
+          llvm-objcopy --version
+
+      - name: 安装 osm0sis mkbootimg (C源码, 需make编译, 去掉‑Werror兼容新GCC)
         run: |
           git clone --depth=1 https://github.com/osm0sis/mkbootimg.git
           cd mkbootimg
@@ -127,7 +143,6 @@ jobs:
       - name: 全 LLVM 编译内核 (作者强制规范)
         working-directory: kernel
         run: |
-          # 【修复】LD必须为ld.lld‑XX，不是lld‑XX
           make -j$(nproc) ARCH=arm64 \
             CC=clang-${{ inputs.CLANG_VERSION }} \
             LD=ld.lld-${{ inputs.CLANG_VERSION }} \
@@ -143,22 +158,22 @@ jobs:
           make BOOT_PARTITION=${{ env.PHYSICAL_ROOT_PART }}
           cp initramfs.cpio.lz4 ../initramfs-physical.cpio.lz4
 
-      - name: 打包 boot-physical.img
+      - name: 打包 boot‑physical.img，cmdline加入mem=6G适配6+128版本
         run: |
           mkbootimg \
             --kernel kernel/Image_with_dtb \
-            --ramdisk initramfs-physical.cpio.lz4 \
+            --ramdisk initramfs‑physical.cpio.lz4 \
             --cmdline "earlycon=0x11200000,115200 root=${{ env.PHYSICAL_ROOT_PART }} rootfstype=ext4 loglevel=7 PMOS_NOSPLASH mem=6G" \
-            -o boot-physical.img
+            -o boot‑physical.img
 
       - name: 上传内核编译产物
         uses: actions/upload-artifact@v4
         with:
           name: kernel-output
           path: |
-            boot-physical.img
+            boot‑physical.img
             kernel/Image_with_dtb
-            initramfs-physical.cpio.lz4
+            initramfs‑physical.cpio.lz4
 
   # ============================================================
   # Job 2: 构建 RootFS (postmarketOS / Arch Linux ARM / Ubuntu)
@@ -182,9 +197,9 @@ jobs:
       #       *.img
       #       *.tar.gz
       #       ~/.local/var/pmbootstrap/cache_apk
-      #     key: rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-${{ github.run_id }}
-      #     restore-keys: |
-      #       rootfs-${{ inputs.ROOTFS_TYPE }}-${{ inputs.PMOS_UI }}-
+      #     key: rootfs‑${{ inputs.ROOTFS_TYPE }}‑${{ inputs.PMOS_UI }}‑${{ github.run_id }}
+      #     restore‑keys: |
+      #       rootfs‑${{ inputs.ROOTFS_TYPE }}‑${{ inputs.PMOS_UI }}‑
 
       - name: 构建 postmarketOS rootfs (pmbootstrap)
         if: ${{ inputs.ROOTFS_TYPE == 'postmarketOS' }}
@@ -193,9 +208,9 @@ jobs:
           git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
           pip3 install --break-system-packages ./pmbootstrap
           PMOS_UI="${{ inputs.PMOS_UI }}"
-          printf '\ngeneric\ngeneric-aarch64\nmainline\n%s\nedge\n\n\n\n\n\n\n\n\n\n' "${PMOS_UI}" | pmbootstrap init
-          pmbootstrap install --no-kernel --filesystem ext4
-          PMOS_IMG=$(ls -t ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/generic-aarch64*.img 2>/dev/null | head -1)
+          printf '\ngeneric\ngeneric‑aarch64\nmainline\n%s\nedge\n\n\n\n\n\n\n\n\n\n' "${PMOS_UI}" | pmbootstrap init
+          pmbootstrap install --no‑kernel --filesystem ext4
+          PMOS_IMG=$(ls -t ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/generic‑aarch64*.img 2>/dev/null | head -1)
           if [ -z "$PMOS_IMG" ]; then echo "错误: 未找到pmOS镜像"; exit 1; fi
           sudo losetup -P -f "$PMOS_IMG"
           LOOP_DEV=$(sudo losetup -j "$PMOS_IMG" | cut -d: -f1)
@@ -211,13 +226,13 @@ jobs:
       - name: 构建 Arch Linux ARM rootfs
         if: ${{ inputs.ROOTFS_TYPE == 'Arch Linux ARM' }}
         run: |
-          URL="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
-          wget -q --show-progress -O ArchLinuxARM-aarch64.tar.gz "$URL"
+          URL="http://os.archlinuxarm.org/os/ArchLinuxARM‑aarch64‑latest.tar.gz"
+          wget -q --show‑progress -O ArchLinuxARM‑aarch64.tar.gz "$URL"
           dd if=/dev/zero of=rootfs.img bs=1M count=4096 status=progress
           mkfs.ext4 -F rootfs.img
           mkdir -p rootfs_mnt
           sudo mount -o loop rootfs.img rootfs_mnt
-          sudo tar -xzf ArchLinuxARM-aarch64.tar.gz -C rootfs_mnt
+          sudo tar -xzf ArchLinuxARM‑aarch64.tar.gz -C rootfs_mnt
           sudo umount rootfs_mnt
           rmdir rootfs_mnt
 
@@ -226,23 +241,23 @@ jobs:
         run: |
           UBUNTU_VER="${{ inputs.UBUNTU_VERSION }}"
           VER_NUM=$(echo "$UBUNTU_VER" | sed 's/ LTS//')
-          BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${VER_NUM}/release"
-          FILENAME=$(curl -s "$BASE_URL/" | grep -oE "ubuntu-base-${VER_NUM}[^\"']*base-arm64\.tar\.gz" | sort -V | tail -1)
+          BASE_URL="https://cdimage.ubuntu.com/ubuntu‑base/releases/${VER_NUM}/release"
+          FILENAME=$(curl -s "$BASE_URL/" | grep -oE "ubuntu‑base‑${VER_NUM}[^\"']*base‑arm64\.tar\.gz" | sort -V | tail -1)
           if [ -z "$FILENAME" ]; then echo "错误:找不到Ubuntu镜像"; exit 1; fi
           URL="${BASE_URL}/${FILENAME}"
-          wget -q --show-progress -O ubuntu-base-arm64.tar.gz "$URL"
+          wget -q --show‑progress -O ubuntu‑base‑arm64.tar.gz "$URL"
           dd if=/dev/zero of=rootfs.img bs=1M count=4096 status=progress
           mkfs.ext4 -F rootfs.img
           mkdir -p rootfs_mnt
           sudo mount -o loop rootfs.img rootfs_mnt
-          sudo tar -xzf ubuntu-base-arm64.tar.gz -C rootfs_mnt
+          sudo tar -xzf ubuntu‑base‑arm64.tar.gz -C rootfs_mnt
           sudo umount rootfs_mnt
           rmdir rootfs_mnt
 
       - name: 上传 RootFS 产物
         uses: actions/upload-artifact@v4
         with:
-          name: rootfs-output
+          name: rootfs‑output
           path: |
             rootfs.img
 
@@ -251,7 +266,7 @@ jobs:
   # ============================================================
   notify:
     name: 发送构建通知
-    runs-on: ubuntu-latest
+    runs-on: ubuntu‑latest
     needs: [kernel, rootfs]
     if: ${{ always() && inputs.ENABLE_NOTIFY }}
     steps:
@@ -267,6 +282,7 @@ jobs:
           if [[ "$KERNEL_RESULT" == "failure" ]]; then
             overall="failure"
           fi
+          # rootfs为skipped代表任务没有执行，不计入失败
           if [[ "$ROOTFS_RESULT" != "skipped" && "$ROOTFS_RESULT" == "failure" ]]; then
             overall="failure"
           fi
