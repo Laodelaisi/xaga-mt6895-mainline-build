@@ -266,69 +266,7 @@ jobs:
             rootfs.img
 
   # ============================================================
-  # Job3: 上传产物到GitHub Release（草稿模式，需要手动发布）
-  # ============================================================
-    release:
-    name: 上传产物到Release(草稿)
-    runs-on: ubuntu-latest
-    needs: [kernel, rootfs]
-    if: ${{ always() && inputs.UPLOAD_TO_RELEASE }}
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout 本仓库
-        uses: actions/checkout@v5
-
-      - name: 下载内核产物 kernel-output
-        uses: actions/download-artifact@v4
-        with:
-          name: kernel-output
-          path: ./release_assets
-
-      - name: 下载rootfs产物 rootfs-output
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs-output
-          path: ./release_assets
-
-      - name: 准备release正文
-        id: release_body
-        run: |
-          RUN_ID=${{ github.run_id }}
-          TASK="${{ inputs.TASK }}"
-          ROOTFS_TYPE="${{ inputs.ROOTFS_TYPE }}"
-          PMOS_UI="${{ inputs.PMOS_UI }}"
-          UBUNTU_VER="${{ inputs.UBUNTU_VERSION }}"
-          cat > body.md <<EOF
-### xaga‑mt6895‑mainline-build 构建输出
-- GitHub Run ID: ${RUN_ID}
-- 构建任务: ${TASK}
-- RootFS: ${ROOTFS_TYPE}
-- pmOS UI: ${PMOS_UI}
-- Ubuntu版本: ${UBUNTU_VER}
-
-> ⚠️ **此为草稿Release，请校验文件后手动点击Publish release正式发布**
-EOF
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          cat body.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: 创建草稿Release并上传资产
-        uses: softprops/action-gh-release@v3
-        with:
-          name: "Build-${{ github.run_id }}"
-          tag_name: "build-${{ github.run_id }}"
-          draft: true
-          prerelease: true
-          body: ${{ steps.release_body.outputs.body }}
-          files: |
-            ./release_assets/*
-          overwrite_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ============================================================
-  # Job 4: 编译完成通知 (钉钉 / Server酱)
+  # Job 3: 编译完成通知 (钉钉 / Server酱)
   # ============================================================
   notify:
     name: 发送构建通知
