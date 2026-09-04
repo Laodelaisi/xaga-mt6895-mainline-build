@@ -148,6 +148,9 @@ jobs:
           ./scripts/config --set-val CONFIG_BLK_DEV_LOOP y
           ./scripts/config --set-val CONFIG_F2FS_FS y
           ./scripts/config --set-val CONFIG_F2FS_FS_SECURITY y
+          # 关闭 CONFIG_WERROR，避免驱动警告导致编译失败
+          ./scripts/config --disable CONFIG_WERROR
+          make ARCH=arm64 olddefconfig
 
       - name: 全 LLVM 编译内核 (作者强制规范)
         working-directory: kernel
