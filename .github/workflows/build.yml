@@ -55,6 +55,7 @@ env:
   INITRAMFS_REPO: "MT6895-Mainline/initramfs"
   PHYSICAL_ROOT_PART: "/dev/mmcblk0p86"
   LOOP_IMG_PATH: "/pmos/rootfs.img"
+  CCACHE_MAXSIZE: "2G"
 
 jobs:
   # ============================================================
@@ -76,11 +77,10 @@ jobs:
             build-essential bison flex libelf-dev libssl-dev cpio lz4 wget git ccache \
             device-tree-compiler f2fs-tools util-linux
           # 添加 LLVM 官方源
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ inputs.CLANG_VERSION }} main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ inputs.CLANG_VERSION }} main" | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt update
           sudo apt install -y clang-${{ inputs.CLANG_VERSION }} llvm-${{ inputs.CLANG_VERSION }} lld-${{ inputs.CLANG_VERSION }}
-
           # 创建不带版本后缀符号链接，修复 LLVM=1 模式下各类工具 not found
           CLANG_VER=${{ inputs.CLANG_VERSION }}
           sudo ln -sf /usr/bin/clang-${CLANG_VER} /usr/bin/clang
@@ -92,7 +92,6 @@ jobs:
           sudo ln -sf /usr/bin/llvm-objcopy-${CLANG_VER} /usr/bin/llvm-objcopy
           sudo ln -sf /usr/bin/llvm-readelf-${CLANG_VER} /usr/bin/llvm-readelf
           sudo ln -sf /usr/bin/llvm-strip-${CLANG_VER} /usr/bin/llvm-strip
-
           # 全部工具校验
           llvm-ar --version
           llvm-nm --version
@@ -102,7 +101,7 @@ jobs:
           ccache -M ${CCACHE_MAXSIZE}
           ccache -z
 
-      - name: 安装 osm0sis mkbootimg (C源码, 需make编译, 去掉‑Werror兼容新GCC)
+      - name: 安装 osm0sis mkbootimg (C源码, 去掉‑Werror兼容新GCC)
         run: |
           git clone --depth=1 https://github.com/osm0sis/mkbootimg.git
           cd mkbootimg
@@ -125,25 +124,30 @@ jobs:
       #     restore-keys: |
       #       kernel-clang-${{ env.KERNEL_BRANCH }}-
 
-      - name: 拉取主线内核源码
+      - name: 拉取主线内核源码，检出蓝牙/触控/Panthor全套修复commit
         run: |
           if [ ! -d "kernel" ]; then
             git clone -b ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel
           fi
+          cd kernel
+          git fetch origin
+          git checkout 4fadce8d6bbce016a8965ad93a5285c565401c1d
 
-      - name: 拉取项目专用 initramfs
+      - name: 拉取项目专用 initramfs，检出蓝牙配套修复commit
         run: |
           git clone https://github.com/${{ env.INITRAMFS_REPO }}.git initramfs
+          cd initramfs
+          git fetch origin
+          git checkout 126b0c137338c1ec6a2cbc434bd67239ce2e38c7
 
       - name: 加载平台 defconfig + 开启 Loop/F2FS
         working-directory: kernel
         run: |
           cp arch/arm64/configs/xaga.config arch/arm64/configs/xaga_defconfig
-          # defconfig仅传ARCH，禁止传入CC/LD，防止Kconfig链接器校验报错
           make ARCH=arm64 xaga_defconfig
           ./scripts/config --set-val CONFIG_BLK_DEV_LOOP y
           ./scripts/config --set-val CONFIG_F2FS_FS y
-          ./scripts/config --set-val CONFIG_F2FS_STAT_FS y
+          ./scripts/config --set-val CONFIG_F2FS_FS_SECURITY y
 
       - name: 全 LLVM 编译内核 (作者强制规范)
         working-directory: kernel
@@ -153,7 +157,7 @@ jobs:
             LD=ld.lld-${{ inputs.CLANG_VERSION }} \
             LLVM=1 LLVM_IAS=1
           # Image + DTB 拼接，绕过原厂LK dtbo限制
-          cat arch/arm64/boot/Image arch/arm64/boot/dts/mediatek/mt6895-xaga.dtb > Image_with_dtb
+          cat arch/arm64/boot/Image arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb > Image_with_dtb
           hexdump -C Image_with_dtb | grep d00dfeed
 
       - name: 编译 initramfs (物理分区版)
@@ -163,22 +167,22 @@ jobs:
           make BOOT_PARTITION=${{ env.PHYSICAL_ROOT_PART }}
           cp initramfs.cpio.lz4 ../initramfs-physical.cpio.lz4
 
-      - name: 打包 boot‑physical.img，cmdline加入mem=6G适配6+128版本
+      - name: 打包 boot‑physical.img，cmdline适配6+128内存
         run: |
           mkbootimg \
             --kernel kernel/Image_with_dtb \
-            --ramdisk initramfs‑physical.cpio.lz4 \
+            --ramdisk initramfs-physical.cpio.lz4 \
             --cmdline "earlycon=0x11200000,115200 root=${{ env.PHYSICAL_ROOT_PART }} rootfstype=ext4 loglevel=7 PMOS_NOSPLASH mem=6G" \
-            -o boot‑physical.img
+            -o boot-physical.img
 
       - name: 上传内核编译产物
         uses: actions/upload-artifact@v4
         with:
           name: kernel-output
           path: |
-            boot‑physical.img
+            boot-physical.img
             kernel/Image_with_dtb
-            initramfs‑physical.cpio.lz4
+            initramfs-physical.cpio.lz4
 
   # ============================================================
   # Job 2: 构建 RootFS (postmarketOS / Arch Linux ARM / Ubuntu)
@@ -213,9 +217,9 @@ jobs:
           git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
           pip3 install --break-system-packages ./pmbootstrap
           PMOS_UI="${{ inputs.PMOS_UI }}"
-          printf '\ngeneric\ngeneric‑aarch64\nmainline\n%s\nedge\n\n\n\n\n\n\n\n\n\n' "${PMOS_UI}" | pmbootstrap init
-          pmbootstrap install --no‑kernel --filesystem ext4
-          PMOS_IMG=$(ls -t ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/generic‑aarch64*.img 2>/dev/null | head -1)
+          printf '\ngeneric\ngeneric-aarch64\nmainline\n%s\nedge\n\n\n\n\n\n\n\n\n\n' "${PMOS_UI}" | pmbootstrap init
+          pmbootstrap install --no-kernel --filesystem ext4
+          PMOS_IMG=$(ls -t ~/.local/var/pmbootstrap/chroot_native/home/pmos/rootfs/generic-aarch64*.img 2>/dev/null | head -1)
           if [ -z "$PMOS_IMG" ]; then echo "错误: 未找到pmOS镜像"; exit 1; fi
           sudo losetup -P -f "$PMOS_IMG"
           LOOP_DEV=$(sudo losetup -j "$PMOS_IMG" | cut -d: -f1)
@@ -231,13 +235,13 @@ jobs:
       - name: 构建 Arch Linux ARM rootfs
         if: ${{ inputs.ROOTFS_TYPE == 'Arch Linux ARM' }}
         run: |
-          URL="http://os.archlinuxarm.org/os/ArchLinuxARM‑aarch64‑latest.tar.gz"
-          wget -q --show‑progress -O ArchLinuxARM‑aarch64.tar.gz "$URL"
+          URL="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+          wget -q --show-progress -O ArchLinuxARM-aarch64.tar.gz "$URL"
           dd if=/dev/zero of=rootfs.img bs=1M count=4096 status=progress
           mkfs.ext4 -F rootfs.img
           mkdir -p rootfs_mnt
           sudo mount -o loop rootfs.img rootfs_mnt
-          sudo tar -xzf ArchLinuxARM‑aarch64.tar.gz -C rootfs_mnt
+          sudo tar -xzf ArchLinuxARM-aarch64.tar.gz -C rootfs_mnt
           sudo umount rootfs_mnt
           rmdir rootfs_mnt
 
@@ -246,23 +250,23 @@ jobs:
         run: |
           UBUNTU_VER="${{ inputs.UBUNTU_VERSION }}"
           VER_NUM=$(echo "$UBUNTU_VER" | sed 's/ LTS//')
-          BASE_URL="https://cdimage.ubuntu.com/ubuntu‑base/releases/${VER_NUM}/release"
-          FILENAME=$(curl -s "$BASE_URL/" | grep -oE "ubuntu‑base‑${VER_NUM}[^\"']*base‑arm64\.tar\.gz" | sort -V | tail -1)
+          BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${VER_NUM}/release"
+          FILENAME=$(curl -s "$BASE_URL/" | grep -oE "ubuntu-base-${VER_NUM}[^\"]*base-arm64\.tar\.gz" | sort -V | tail -1)
           if [ -z "$FILENAME" ]; then echo "错误:找不到Ubuntu镜像"; exit 1; fi
           URL="${BASE_URL}/${FILENAME}"
-          wget -q --show‑progress -O ubuntu‑base‑arm64.tar.gz "$URL"
+          wget -q --show-progress -O ubuntu-base-arm64.tar.gz "$URL"
           dd if=/dev/zero of=rootfs.img bs=1M count=4096 status=progress
           mkfs.ext4 -F rootfs.img
           mkdir -p rootfs_mnt
           sudo mount -o loop rootfs.img rootfs_mnt
-          sudo tar -xzf ubuntu‑base‑arm64.tar.gz -C rootfs_mnt
+          sudo tar -xzf ubuntu-base-arm64.tar.gz -C rootfs_mnt
           sudo umount rootfs_mnt
           rmdir rootfs_mnt
 
       - name: 上传 RootFS 产物
         uses: actions/upload-artifact@v4
         with:
-          name: rootfs‑output
+          name: rootfs-output
           path: |
             rootfs.img
 
@@ -271,7 +275,7 @@ jobs:
   # ============================================================
   notify:
     name: 发送构建通知
-    runs-on: ubuntu‑latest
+    runs-on: ubuntu-latest
     needs: [kernel, rootfs]
     if: ${{ always() && inputs.ENABLE_NOTIFY }}
     steps:
