@@ -1,24 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xaga-mt6895-mainline-build 自动化助手 bot.py
+bot.py —— xaga (Redmi Note 11T Pro / MT6895) 构建机器人
 
-功能:
-  1. 编译完成通知: 钉钉 Webhook / Server酱(微信/QQ推送)
-  2. 上游内核更新检测: 监控 MT6895-Mainline/linux 7.2 分支
-  3. 自动触发构建: 检测到上游更新后自动调用 GitHub API 触发 Build.yml
-  4. 补丁记录: 将上游最新 commit 写入 .last_upstream_commit 并提交到本仓库
+三件事，可以单独用也可以串起来用：
 
-用法:
-  python3 bot.py --notify --status success --artifact-url <url>
-  python3 bot.py --check-update --auto-build
-  python3 bot.py --check-update --auto-build --commit-patch
+  1) --check-upstream   检查上游内核 / initramfs 有没有新 commit（用于「有新提交才构建」）
+  2) --save-state       把本次构建实际用的 commit 记下来（写 .github/build-state.json 并推回仓库）
+  3) --trigger          主动触发 GitHub Actions 构建（workflow_dispatch）
+  4) --notify           构建结果推送到 喵提醒 / Server酱（可选钉钉）
 
-环境变量(在 GitHub Secrets 中配置):
-  DINGTALK_WEBHOOK   钉钉机器人 Webhook 完整地址(含access_token)
-  DINGTALK_SECRET    钉钉机器人加签密钥(可选, 未设置则不加签)
-  SERVERCHAN_KEY     Server酱 SendKey (sct开头, 可选)
-  GITHUB_TOKEN       GitHub Token (Actions 中自动注入 GITHUB_TOKEN)
+--------------------------------------------------------------------------------
+环境变量（GitHub Secrets / 本地都读，缺的会跳过对应渠道，不会报错）
+
+  喵提醒    MIAO_ID              （喵提醒 https://miaotixing.com 里的「提醒ID」）
+  Server酱  SERVERCHAN_KEY      （SendKey，sctapi.ftqq.com 或 sc.ftqq.com 都吃）
+  钉钉      DINGTALK_WEBHOOK / DINGTALK_SECRET   （可选，保留兼容）
+  GitHub    GITHUB_TOKEN | GH_TOKEN  （提高 API 限额；--save-state / --trigger 必需）
+  上游覆盖  UPSTREAM_REPO=MT6895-Mainline/linux  UPSTREAM_BRANCH=7.2-mt6895-xiaomi-xaga
+            INITRAMFS_REPO=MT6895-Mainline/initramfs  INITRAMFS_BRANCH=xaga-mt6895
+
+--------------------------------------------------------------------------------
+用法
+
+  # 1. 构建完成的通知（工作流里就是这条）
+  python3 bot.py --notify --status success --artifact-url "https://github.com/.../runs/123"
+
+  # 2. 检查上游有没有新提交；结果写进 $GITHUB_OUTPUT，本机跑就打印出来
+  python3 bot.py --check-upstream
+  python3 bot.py --check-upstream --force          # 强制认为有更新
+
+  # 3. 有更新就自动触发构建（本机 cron / 其它 CI 都能用）
+  python3 bot.py --check-upstream --trigger-build
+
+  # 4. 构建成功后记状态（工作流最后一步）
+  python3 bot.py --save-state --kernel-commit <sha> --initramfs-commit <sha>
+
+不需要任何第三方库（纯标准库），Python 3.8+ 都能跑。
 """
 
 import argparse
@@ -27,292 +45,684 @@ import hashlib
 import hmac
 import json
 import os
-import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
+
+DEFAULT_STATE = os.path.join(".github", "build-state.json")
+
+UPSTREAM_REPO = os.environ.get("UPSTREAM_REPO", "MT6895-Mainline/linux")
+UPSTREAM_BRANCH = os.environ.get("UPSTREAM_BRANCH", "7.2-mt6895-xiaomi-xaga")
+INITRAMFS_REPO = os.environ.get("INITRAMFS_REPO", "MT6895-Mainline/initramfs")
+INITRAMFS_BRANCH = os.environ.get("INITRAMFS_BRANCH", "xaga-mt6895")
+DEFAULT_WORKFLOW = os.environ.get("BUILD_WORKFLOW", "build-mainline.yml")
+
+TIMEOUT = 25
 
 
-# ============================================================
-# 配置常量
-# ============================================================
-UPSTREAM_REPO = "MT6895-Mainline/linux"
-UPSTREAM_BRANCH = "7.2-mt6895-xiaomi-xaga"
-LOCAL_REPO = os.environ.get("GITHUB_REPOSITORY", "")
-WORKFLOW_FILE = "Build.yml"
-DEFAULT_BRANCH = "main"
-COMMIT_RECORD_FILE = ".last_upstream_commit"
+# --------------------------------------------------------------------------- #
+# 小工具
+# --------------------------------------------------------------------------- #
+def log(msg):
+    print(msg, flush=True)
 
 
-# ============================================================
-# 工具函数
-# ============================================================
-def _http_post(url, data, headers=None):
-    """通用 HTTP POST, 返回 (status_code, response_text)"""
-    if headers is None:
-        headers = {"Content-Type": "application/json"}
-    body = json.dumps(data).encode("utf-8") if isinstance(data, dict) else data
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+def gh_token():
+    return (os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GH_TOKEN")
+            or "").strip()
+
+
+def set_output(**kwargs):
+    """写 $GITHUB_OUTPUT（在 Actions 里）；本机跑则打印。"""
+    path = os.environ.get("GITHUB_OUTPUT")
+    lines = []
+    for k, v in kwargs.items():
+        v = str(v)
+        # 多行值要用 heredoc 语法
+        if "\n" in v:
+            lines.append("%s<<__EOF__\n%s\n__EOF__" % (k, v))
+        else:
+            lines.append("%s=%s" % (k, v))
+    text = "\n".join(lines)
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    else:
+        log("[output]")
+        for line in lines:
+            log("  " + line.replace("\n", "\n  "))
+
+
+def set_env(**kwargs):
+    path = os.environ.get("GITHUB_ENV")
+    text = "\n".join("%s=%s" % (k, v) for k, v in kwargs.items())
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    else:
+        log("[env]")
+        for k, v in kwargs.items():
+            log("  %s=%s" % (k, v))
+
+
+def step_summary(text):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def http(url, method="GET", data=None, headers=None, timeout=TIMEOUT):
+    """极简 HTTP：返回 (status, body_text)。不抛异常，错误也返回。"""
+    hdrs = {
+        "User-Agent": "xaga-build-bot/2.0",
+        "Accept": "application/vnd.github+json",
+    }
+    if headers:
+        hdrs.update(headers)
+
+    body = None
+    if data is not None:
+        if isinstance(data, (dict, list)):
+            body = json.dumps(data).encode("utf-8")
+            hdrs.setdefault("Content-Type", "application/json")
+        elif isinstance(data, str):
+            body = data.encode("utf-8")
+        else:
+            body = data
+
+    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return -1, str(e)
+        try:
+            return e.code, e.read().decode("utf-8", "replace")
+        except Exception:
+            return e.code, str(e)
+    except Exception as e:                                    # 网络/超时
+        return 0, "NETWORK-ERROR: %s" % e
 
 
-def _http_get_json(url, token=None):
-    """通用 HTTP GET JSON"""
-    headers = {"Accept": "application/vnd.github.v3+json"}
-    if token:
-        headers["Authorization"] = f"token {token}"
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
+def gh_api(path_or_url, method="GET", data=None):
+    """调 GitHub API。path_or_url 可以是 api.github.com 之后的路径。"""
+    if path_or_url.startswith("http"):
+        url = path_or_url
+    else:
+        url = "https://api.github.com" + path_or_url
+    headers = {}
+    tok = gh_token()
+    if tok:
+        headers["Authorization"] = "Bearer " + tok
+    return http(url, method=method, data=data, headers=headers)
 
 
-# ============================================================
-# 通知模块: 钉钉
-# ============================================================
-def send_dingtalk(webhook, secret, title, markdown_text):
-    """发送钉钉 Markdown 消息, 支持加签"""
-    if not webhook:
-        print("[钉钉] 未配置 DINGTALK_WEBHOOK, 跳过")
-        return False
+# --------------------------------------------------------------------------- #
+# 1. 上游检测
+# --------------------------------------------------------------------------- #
+def remote_head(repo, branch):
+    """拿上游分支 HEAD：先试 commits/{branch}，失败退回 git/refs/heads/{branch}。"""
+    st, body = gh_api("/repos/%s/commits/%s" % (repo, urllib.parse.quote(branch)))
+    if st == 200:
+        try:
+            j = json.loads(body)
+            commit = j.get("sha", "")
+            msg = (j.get("commit", {}).get("message", "") or "").splitlines()
+            return {
+                "sha": commit,
+                "short": commit[:12],
+                "message": msg[0] if msg else "",
+                "date": (j.get("commit", {}).get("committer", {}) or {}).get("date", ""),
+            }
+        except (ValueError, AttributeError):
+            pass
 
-    url = webhook
-    if secret:
-        timestamp = str(round(time.time() * 1000))
-        string_to_sign = f"{timestamp}\n{secret}"
-        hmac_code = hmac.new(
-            secret.encode("utf-8"),
-            string_to_sign.encode("utf-8"),
-            digestmod=hashlib.sha256,
-        ).digest()
-        sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}timestamp={timestamp}&sign={sign}"
+    st2, body2 = gh_api("/repos/%s/git/ref/heads/%s" % (repo, urllib.parse.quote(branch)))
+    if st2 == 200:
+        try:
+            j = json.loads(body2)
+            sha = j["object"]["sha"]
+            return {"sha": sha, "short": sha[:12], "message": "", "date": ""}
+        except (ValueError, KeyError):
+            pass
+
+    return {"error": "无法读取 %s@%s（HTTP %s/%s）" % (repo, branch, st, st2)}
+
+
+def load_state(path):
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (ValueError, OSError):
+        return {}
+
+
+def cmd_check_upstream(args):
+    state = load_state(args.state)
+
+    kern = remote_head(args.upstream_repo, args.upstream_branch)
+    if "error" in kern:
+        # 网络问题不应该让整条流水线挂掉：报错但按「不构建」处理，
+        # 除非显式 --build-on-error
+        log("[!] %s" % kern["error"])
+        set_output(changed="false", reason="api-error")
+        set_env(SHOULD_BUILD="false")
+        step_summary("### 上游检测失败\n\n%s\n" % kern["error"])
+        return 1 if args.build_on_error else 0
+
+    init = remote_head(args.initramfs_repo, args.initramfs_branch)
+    init_sha = init.get("sha", "") if "error" not in init else ""
+
+    last_kernel = (state.get("kernel_commit") or "").strip()
+    last_initramfs = (state.get("initramfs_commit") or "").strip()
+
+    kernel_changed = kern["sha"] != last_kernel
+    initramfs_changed = bool(init_sha) and init_sha != last_initramfs
+    changed = kernel_changed or initramfs_changed
+
+    if args.force:
+        changed = True
+
+    # 没有 state 文件 = 第一次跑，视为「有更新」构建一次
+    first_run = not state
+
+    reason = []
+    if first_run:
+        reason.append("首次运行（无 build-state.json）")
+    if kernel_changed:
+        reason.append("内核 %s -> %s" % (last_kernel[:12] or "(空)", kern["short"]))
+    if initramfs_changed:
+        reason.append("initramfs %s -> %s" % (last_initramfs[:12] or "(空)", init_sha[:12]))
+    if not reason:
+        reason.append("上游无变化")
+
+    log("上游内核     : %s %s  %s" % (args.upstream_branch, kern["short"], kern["message"]))
+    log("镜像内内核   : %s" % (last_kernel[:12] or "(未知)"))
+    log("上游 initramfs: %s" % (init_sha[:12] or "(读取失败)"))
+    log("镜像内 initramfs: %s" % (last_initramfs[:12] or "(未知)"))
+    log("是否需要构建 : %s  (%s)" % ("是" if changed else "否", " / ".join(reason)))
+
+    set_output(
+        changed="true" if changed else "false",
+        kernel_changed="true" if kernel_changed else "false",
+        initramfs_changed="true" if initramfs_changed else "false",
+        upstream_commit=kern["sha"],
+        upstream_short=kern["short"],
+        upstream_message=kern["message"],
+        initramfs_commit=init_sha,
+        last_kernel_commit=last_kernel,
+        reason=" / ".join(reason),
+    )
+    set_env(SHOULD_BUILD="true" if changed else "false",
+            UPSTREAM_COMMIT=kern["sha"])
+
+    # 顺手落一份 JSON：工作流里同一个 step 内没法读 $GITHUB_OUTPUT（要等下一个 step），
+    # 有这么个文件就能在同一 step 里立刻取值。
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump({
+                "changed": changed,
+                "kernel_changed": kernel_changed,
+                "initramfs_changed": initramfs_changed,
+                "upstream_commit": kern["sha"],
+                "upstream_short": kern["short"],
+                "upstream_message": kern["message"],
+                "initramfs_commit": init_sha,
+                "last_kernel_commit": last_kernel,
+                "last_initramfs_commit": last_initramfs,
+                "reason": " / ".join(reason),
+            }, f, indent=2, ensure_ascii=False)
+        log("已写 %s" % args.json)
+
+    step_summary(
+        "### 上游检测\n\n"
+        "| 项目 | 值 |\n|---|---|\n"
+        "| 上游内核 HEAD | `%s` %s |\n"
+        "| 已构建内核 | `%s` |\n"
+        "| 上游 initramfs | `%s` |\n"
+        "| 已构建 initramfs | `%s` |\n"
+        "| 是否构建 | **%s** |\n"
+        "| 原因 | %s |\n"
+        % (kern["short"], kern["message"], last_kernel[:12] or "—",
+           init_sha[:12] or "—", last_initramfs[:12] or "—",
+           "是" if changed else "否", " / ".join(reason))
+    )
+
+    if args.trigger_build and changed:
+        rc = do_trigger(args)
+        set_output(triggered="true" if rc == 0 else "false")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# 2. 状态保存（写回仓库）
+# --------------------------------------------------------------------------- #
+def cmd_save_state(args):
+    state = load_state(args.state)
+    state.update({
+        "kernel_commit": args.kernel_commit or state.get("kernel_commit", ""),
+        "kernel_branch": args.kernel_branch or UPSTREAM_BRANCH,
+        "kernel_repo": args.kernel_repo or UPSTREAM_REPO,
+        "initramfs_commit": args.initramfs_commit or state.get("initramfs_commit", ""),
+        "initramfs_branch": INITRAMFS_BRANCH,
+        "initramfs_repo": INITRAMFS_REPO,
+        "boot_img_sha256": args.boot_img_sha256 or state.get("boot_img_sha256", ""),
+        "rootfs_sha256": args.rootfs_sha256 or state.get("rootfs_sha256", ""),
+        "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_url": args.run_url or "",
+    })
+
+    os.makedirs(os.path.dirname(args.state) or ".", exist_ok=True)
+    with open(args.state, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    log("已写 %s" % args.state)
+    log(json.dumps(state, indent=2, ensure_ascii=False))
+
+    if args.no_push:
+        return 0
+
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not repo or not gh_token():
+        log("[!] 没有 GITHUB_REPOSITORY / TOKEN，只写本地文件不推送")
+        return 0
+
+    # 用 Contents API 提交（比 git push 稳，不用处理 credentials / rebase）
+    remote = args.state.replace(os.sep, "/")
+    st, body = gh_api("/repos/%s/contents/%s?ref=%s"
+                      % (repo, urllib.parse.quote(remote),
+                         urllib.parse.quote(args.ref)))
+    sha = ""
+    if st == 200:
+        try:
+            sha = json.loads(body).get("sha", "")
+        except ValueError:
+            pass
 
     payload = {
-        "msgtype": "markdown",
-        "markdown": {"title": title, "text": markdown_text},
+        "message": "chore(bot): 记录已构建内核 commit %s [skip ci]"
+                   % (state.get("kernel_commit", "")[:12] or "unknown"),
+        "content": base64.b64encode(
+            json.dumps(state, indent=2, ensure_ascii=False).encode("utf-8")
+            + b"\n").decode("ascii"),
+        "branch": args.ref,
     }
-    code, body = _http_post(url, payload)
-    print(f"[钉钉] HTTP {code}: {body[:200]}")
-    return code == 200 and '"errcode":0' in body
+    if sha:
+        payload["sha"] = sha
+
+    st, body = gh_api("/repos/%s/contents/%s" % (repo, urllib.parse.quote(remote)),
+                      method="PUT", data=payload)
+    if st in (200, 201):
+        log("状态已提交回仓库 (%s)" % repo)
+        return 0
+    log("[!] 提交状态失败 HTTP %s: %s" % (st, body[:400]))
+    return 0        # 状态回写失败不该让流水线挂掉
 
 
-# ============================================================
-# 通知模块: Server酱 (可推送到微信/QQ)
-# ============================================================
-def send_serverchan(sckey, title, content):
-    """Server酱推送, sckey 格式 sctxxxxxxxx"""
-    if not sckey:
-        print("[Server酱] 未配置 SERVERCHAN_KEY, 跳过")
-        return False
+# --------------------------------------------------------------------------- #
+# 3. 触发构建
+# --------------------------------------------------------------------------- #
+def do_trigger(args):
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    tok = gh_token()
+    if not repo or not tok:
+        log("[!] --trigger 需要 GITHUB_REPOSITORY 与 GITHUB_TOKEN/GH_TOKEN")
+        return 1
 
-    url = f"https://sctapi.ftqq.com/{sckey}.send"
-    data = urllib.parse.urlencode({"title": title, "desp": content}).encode("utf-8")
-    code, body = _http_post(url, data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    print(f"[Server酱] HTTP {code}: {body[:200]}")
-    return code == 200
+    inputs = {}
+    for k, v in (("TASK", args.task), ("ROOTFS_TYPE", args.rootfs_type),
+                 ("KERNEL_COMMIT", args.kernel_commit),
+                 ("USB_GADGET", args.usb_gadget)):
+        if v:
+            inputs[k] = v
 
-
-# ============================================================
-# 通知入口
-# ============================================================
-def do_notify(status, artifact_url):
-    """编译完成通知"""
-    is_success = status == "success"
-    emoji = "✅" if is_success else "❌"
-    status_text = "构建成功" if is_success else "构建失败"
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-
-    title = f"{emoji} xaga主线内核 - {status_text}"
-
-    md = f"""### {emoji} xaga MT6895 主线内核构建通知
-
-| 项目 | 内容 |
-|------|------|
-| **状态** | {status_text} |
-| **时间** | {now} |
-| **内核分支** | {UPSTREAM_BRANCH} |
-| **上游仓库** | {UPSTREAM_REPO} |
-"""
-    if artifact_url:
-        md += f"| **构建记录** | [点击查看产物]({artifact_url}) |\n"
-
-    webhook = os.environ.get("DINGTALK_WEBHOOK", "")
-    secret = os.environ.get("DINGTALK_SECRET", "")
-    sckey = os.environ.get("SERVERCHAN_KEY", "")
-
-    send_dingtalk(webhook, secret, title, md)
-    send_serverchan(sckey, title, md)
+    payload = {"ref": args.ref, "inputs": inputs}
+    url = "/repos/%s/actions/workflows/%s/dispatches" % (repo, args.workflow)
+    st, body = gh_api(url, method="POST", data=payload)
+    if st in (204, 200):
+        log("已触发构建: %s (ref=%s) inputs=%s" % (args.workflow, args.ref, inputs))
+        return 0
+    log("[!] 触发失败 HTTP %s: %s" % (st, body[:400]))
+    return 1
 
 
-# ============================================================
-# 上游更新检测
-# ============================================================
-def get_upstream_latest_commit(token):
-    """获取上游仓库指定分支最新 commit, 返回 (sha, message)"""
-    url = f"https://api.github.com/repos/{UPSTREAM_REPO}/commits/{UPSTREAM_BRANCH}"
-    data = _http_get_json(url, token)
-    sha = data["sha"]
-    message = data["commit"]["message"].split("\n")[0]
-    author = data["commit"]["author"]["name"]
-    return sha, message, author
+def cmd_trigger(args):
+    return do_trigger(args)
 
 
-def get_local_recorded_commit():
-    """读取本地记录的上次上游 commit"""
-    if os.path.exists(COMMIT_RECORD_FILE):
-        with open(COMMIT_RECORD_FILE, "r") as f:
-            return f.read().strip()
-    return ""
+# --------------------------------------------------------------------------- #
+# 4. 通知（喵提醒 / Server酱 / 钉钉）
+# --------------------------------------------------------------------------- #
+def send_miao(text):
+    mid = os.environ.get("MIAO_ID", "").strip()
+    if not mid:
+        return None
+    url = "https://miaotixing.com/trigger"
+    data = urllib.parse.urlencode({"id": mid, "text": text}).encode("ascii")
+    st, body = http(url, method="POST", data=data,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"})
+    ok = st == 200 and "<code>0</code>" in body
+    if not ok:
+        # 有些部署返回 JSON
+        ok = st == 200 and '"code":0' in body.replace(" ", "")
+    return ("喵提醒", ok, "HTTP %s %s" % (st, body[:160]))
 
 
-def save_recorded_commit(sha):
-    """保存上游 commit 记录"""
-    with open(COMMIT_RECORD_FILE, "w") as f:
-        f.write(sha + "\n")
+def send_serverchan(title, desp):
+    key = os.environ.get("SERVERCHAN_KEY", "").strip()
+    if not key:
+        return None
+    for base in ("https://sctapi.ftqq.com", "https://sc.ftqq.com"):
+        url = "%s/%s.send" % (base, key)
+        st, body = http(url, method="POST",
+                        data=urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8"),
+                        headers={"Content-Type": "application/x-www-form-urlencoded"})
+        if st == 200:
+            try:
+                j = json.loads(body)
+                code = j.get("code")
+                if code in (0, "0"):
+                    return ("Server酱", True, "%s %s" % (base, j.get("message", "ok")))
+                if code is None:
+                    return ("Server酱", True, "%s ok" % base)
+                last = "%s code=%s %s" % (base, code, j.get("message", ""))
+            except ValueError:
+                last = "%s HTTP %s" % (base, body[:160])
+        else:
+            last = "%s HTTP %s %s" % (base, st, body[:160])
+    return ("Server酱", False, last)
 
 
-# ============================================================
-# 自动触发构建
-# ============================================================
-def trigger_workflow(token, inputs=None):
-    """通过 GitHub API 触发 Build.yml 工作流"""
-    if not LOCAL_REPO:
-        print("[触发构建] 未设置 GITHUB_REPOSITORY, 跳过")
-        return False
+def send_dingtalk(title, desp):
+    webhook = os.environ.get("DINGTALK_WEBHOOK", "").strip()
+    if not webhook:
+        return None
+    secret = os.environ.get("DINGTALK_SECRET", "").strip()
+    url = webhook
+    if secret:
+        ts = str(int(round(time.time() * 1000)))
+        sign_str = "%s\n%s" % (ts, secret)
+        sign = urllib.parse.quote_plus(
+            base64.b64encode(hmac.new(secret.encode("utf-8"),
+                                      sign_str.encode("utf-8"),
+                                      digestmod=hashlib.sha256).digest()).decode())
+        url = "%s&timestamp=%s&sign=%s" % (webhook, ts, sign)
+    payload = {"msgtype": "markdown",
+               "markdown": {"title": title, "text": "%s\n\n%s" % (title, desp)}}
+    st, body = http(url, method="POST", data=payload)
+    ok = st == 200 and '"errcode":0' in body.replace(" ", "")
+    return ("钉钉", ok, "HTTP %s %s" % (st, body[:160]))
 
-    url = f"https://api.github.com/repos/{LOCAL_REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches"
-    payload = {"ref": DEFAULT_BRANCH}
-    if inputs:
-        payload["inputs"] = inputs
+
+def cmd_notify(args):
+    status_map = {
+        "success": ("✅", "构建成功"),
+        "failure": ("❌", "构建失败"),
+        "cancelled": ("⚪", "构建已取消"),
+    }
+    icon, label = status_map.get(args.status, ("ℹ️", "构建" + args.status))
+
+    lines = [
+        "%s xaga 主线内核 %s" % (icon, label),
+        "",
+        "任务: %s" % (args.task or "(默认全部)"),
+        "内核: %s" % (args.kernel_branch or UPSTREAM_BRANCH),
+    ]
+    if args.kernel_commit:
+        lines.append("commit: %s" % args.kernel_commit)
+    if args.rootfs_type:
+        lines.append("rootfs: %s" % args.rootfs_type)
+    lines.append("时间: %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    if args.details:
+        lines.append("")
+        lines.append(args.details)
+    if args.artifact_url:
+        lines.append("")
+        lines.append("详情: %s" % args.artifact_url)
+
+    if args.markdown:
+        title = "%s xaga %s" % (icon, label)
+        desp = "\n".join(lines)
     else:
-        payload["inputs"] = {
-            "TASK": "全部(内核+RootFS)",
-            "ROOTFS_TYPE": "postmarketOS",
-            "PMOS_UI": "phosh",
-            "CLANG_VERSION": "18",
-        }
+        title = "%s xaga %s" % (icon, label)
+        desp = "\n".join(lines)
 
-    code, body = _http_post(
-        url,
-        payload,
-        headers={
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-            "Content-Type": "application/json",
-        },
-    )
-    print(f"[触发构建] HTTP {code}: {body[:200]}")
-    return code == 204
+    results = [send_miao(desp), send_serverchan(title, desp),
+               send_dingtalk(title, desp)]
+    results = [r for r in results if r]
+
+    if not results:
+        log("[!] 没有配置任何通知渠道（MIAO_ID / SERVERCHAN_KEY / DINGTALK_WEBHOOK 都为空）")
+        return 0
+
+    any_ok = False
+    for name, ok, detail in results:
+        log("%s %-10s %s" % ("[ok]  " if ok else "[fail]", name, detail))
+        any_ok = any_ok or ok
+
+    # 通知失败不改变构建结果，但要让日志里看得见
+    return 0 if any_ok or not args.strict else 1
 
 
-# ============================================================
-# 自动提交补丁记录到本仓库
-# ============================================================
-def commit_patch_record(sha, message, author):
-    """将上游最新 commit 记录提交到本仓库, 便于追踪"""
+# --------------------------------------------------------------------------- #
+# 5. 产物校验（把 python 逻辑放在这个文件里，工作流就不用在 YAML 里写 heredoc）
+# --------------------------------------------------------------------------- #
+BOOT_HDR_SIZE_V4 = 1584
+
+
+def cmd_verify_bootimg(args):
+    """校验 boot.img 头部：magic / header_version / header_size 等。"""
     try:
-        subprocess.run(["git", "config", "user.name", "xaga-bot"], check=True)
-        subprocess.run(["git", "config", "user.email", "xaga-bot@users.noreply.github.com"], check=True)
-        save_recorded_commit(sha)
-        subprocess.run(["git", "add", COMMIT_RECORD_FILE], check=True)
-        commit_msg = (
-            f"chore: track upstream commit {sha[:8]}\n\n"
-            f"Upstream: {UPSTREAM_REPO}@{UPSTREAM_BRANCH}\n"
-            f"Commit: {sha}\n"
-            f"Author: {author}\n"
-            f"Message: {message}\n"
-        )
-        subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-        subprocess.run(["git", "push"], check=True)
-        print(f"[补丁记录] 已提交 {sha[:8]} 到本仓库")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"[补丁记录] 提交失败: {e}")
-        return False
+        with open(args.image, "rb") as f:
+            d = f.read(4096)
+    except OSError as e:
+        log("!! 打不开 %s: %s" % (args.image, e))
+        return 1
+    if len(d) < 0x2c:
+        log("!! %s 太小，不是 boot.img" % args.image)
+        return 1
+
+    import struct as _s
+    magic = d[0x00:0x08]
+    ksize = _s.unpack_from("<I", d, 0x08)[0]
+    rsize = _s.unpack_from("<I", d, 0x0c)[0]
+    osver = _s.unpack_from("<I", d, 0x10)[0]
+    hsize = _s.unpack_from("<I", d, 0x14)[0]
+    hver = _s.unpack_from("<I", d, 0x28)[0]
+
+    log("    magic          : %s" % magic.decode("latin-1"))
+    log("    kernel_size    : %d (%.2f MB)" % (ksize, ksize / 1048576))
+    log("    ramdisk_size   : %d (%.1f KB)" % (rsize, rsize / 1024))
+    log("    os_version     : 0x%08x" % osver)
+    log("    header_size    : %d  (v4 应为 %d)" % (hsize, BOOT_HDR_SIZE_V4))
+    log("    header_version : %d" % hver)
+
+    bad = []
+    if magic != b"ANDROID!":
+        bad.append("magic 不是 ANDROID!")
+    if hver != 4:
+        bad.append("header_version 应为 4，实际 %d" % hver)
+    if hsize != BOOT_HDR_SIZE_V4:
+        bad.append("header_size 应为 %d，实际 %d" % (BOOT_HDR_SIZE_V4, hsize))
+    if ksize == 0:
+        bad.append("kernel 段为空")
+    if rsize == 0:
+        bad.append("ramdisk 段为空")
+    if bad:
+        for b in bad:
+            log("!! %s" % b)
+        return 1
+    log("    OK: boot.img 校验通过")
+    return 0
 
 
-# ============================================================
-# 更新检测入口
-# ============================================================
-def do_check_update(auto_build=False, commit_patch=False):
-    """检测上游内核更新"""
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
-        print("[错误] 需要 GITHUB_TOKEN 才能调用 GitHub API")
-        sys.exit(1)
+def cmd_inspect_image(args):
+    """从裸 Image 里读内核版本串 + 内嵌 .config（IKCFG_ST/IKCFG_ED）。
 
-    print(f"[检测] 上游仓库: {UPSTREAM_REPO}@{UPSTREAM_BRANCH}")
-    sha, message, author = get_upstream_latest_commit(token)
-    print(f"[上游最新] {sha[:8]} - {message} (by {author})")
+    arm64 defconfig 带 CONFIG_IKCONFIG=y + CONFIG_IKCONFIG_PROC=y，
+    所以内核镜像里内嵌了完整 .config（设备上等价于 zcat /proc/config.gz）。
+    """
+    import gzip
+    import re
+    try:
+        raw = open(args.image, "rb").read()
+    except OSError as e:
+        log("!! 打不开 %s: %s" % (args.image, e))
+        return 1
 
-    last_sha = get_local_recorded_commit()
-    print(f"[本地记录] {last_sha[:8] if last_sha else '(无记录)'}")
-
-    if sha == last_sha:
-        print("[结果] 上游无新提交, 无需构建")
-        return
-
-    print(f"[发现更新] {last_sha[:8] if last_sha else '首次'} -> {sha[:8]}")
-
-    if commit_patch:
-        # 先提交记录, 再触发构建
-        commit_patch_record(sha, message, author)
+    m = re.search(rb"Linux version [^\x00\n]{0,140}", raw)
+    if m:
+        log("    %s" % m.group(0).decode("utf-8", "replace"))
     else:
-        save_recorded_commit(sha)
+        log("    (未找到 'Linux version' 版本串)")
 
-    if auto_build:
-        print("[动作] 自动触发 Build.yml 构建...")
-        trigger_workflow(token)
-    else:
-        print("[提示] 未启用 --auto-build, 仅记录不触发构建")
+    s, e = raw.find(b"IKCFG_ST"), raw.find(b"IKCFG_ED")
+    if s < 0 or e < 0:
+        log("    IKCFG 标记不存在（CONFIG_IKCONFIG 没开？）")
+        return 0
+
+    blob = raw[s + 8:e]
+    cfg = None
+    for off in range(0, 16):
+        try:
+            cfg = gzip.decompress(blob[off:]).decode("utf-8", "replace")
+            break
+        except Exception:
+            continue
+    if cfg is None:
+        log("    IKCFG 段 gzip 解压失败")
+        return 0
+
+    keys = args.keys or [
+        "CONFIG_USB_GADGET", "CONFIG_USB_LIBCOMPOSITE", "CONFIG_USB_CONFIGFS",
+        "CONFIG_USB_F_ACM", "CONFIG_USB_U_SERIAL", "CONFIG_USB_CONFIGFS_ACM",
+        "CONFIG_CONFIGFS_FS", "CONFIG_MODULES", "CONFIG_CRYPTO_USER",
+    ]
+    for k in keys:
+        hit = re.search(r"^%s=.*$" % re.escape(k), cfg, re.M)
+        if hit is None and re.search(r"^# %s is not set$" % re.escape(k), cfg, re.M):
+            hit = re.search(r"^# %s is not set$" % re.escape(k), cfg, re.M)
+        log("    %-28s %s" % (k, hit.group(0) if hit else "(unset)"))
+
+    if args.dump:
+        with open(args.dump, "w", encoding="utf-8") as f:
+            f.write(cfg)
+        log("    完整 .config 已写到 %s（%d 行）" % (args.dump, cfg.count("\n")))
+
+    if args.assert_y:
+        missing = [k for k in args.assert_y
+                   if not re.search(r"^%s=y$" % re.escape(k), cfg, re.M)]
+        if missing:
+            log("!! 断言失败，以下项不是 =y: %s" % " ".join(missing))
+            return 1
+        log("    OK: %s 全部 =y" % " ".join(args.assert_y))
+    return 0
 
 
-# ============================================================
-# 主入口
-# ============================================================
-def main():
-    parser = argparse.ArgumentParser(
-        description="xaga-mt6895-mainline-build 自动化助手",
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="xaga 构建机器人：上游 commit 检测 / 触发构建 / 结果通知",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  # 发送构建成功通知
-  python3 bot.py --notify --status success --artifact-url https://github.com/xxx/actions/runs/123
-
-  # 检测上游更新并自动触发构建
-  python3 bot.py --check-update --auto-build
-
-  # 检测更新, 提交补丁记录并触发构建 (需在有写权限的环境运行)
-  python3 bot.py --check-update --auto-build --commit-patch
-        """,
+        epilog=__doc__.split("用法")[-1] if "用法" in __doc__ else None,
     )
-    parser.add_argument("--notify", action="store_true", help="发送构建完成通知")
-    parser.add_argument("--status", default="success", choices=["success", "failure"], help="构建状态")
-    parser.add_argument("--artifact-url", default="", help="产物/构建记录URL")
-    parser.add_argument("--check-update", action="store_true", help="检测上游内核更新")
-    parser.add_argument("--auto-build", action="store_true", help="检测到更新时自动触发构建")
-    parser.add_argument("--commit-patch", action="store_true", help="将上游commit记录提交到本仓库")
+    sub = p.add_subparsers(dest="cmd")
 
-    args = parser.parse_args()
+    common_up = argparse.ArgumentParser(add_help=False)
+    common_up.add_argument("--upstream-repo", default=UPSTREAM_REPO)
+    common_up.add_argument("--upstream-branch", default=UPSTREAM_BRANCH)
+    common_up.add_argument("--initramfs-repo", default=INITRAMFS_REPO)
+    common_up.add_argument("--initramfs-branch", default=INITRAMFS_BRANCH)
+    common_up.add_argument("--state", default=DEFAULT_STATE,
+                           help="状态文件路径（默认 .github/build-state.json）")
 
-    if not args.notify and not args.check_update:
-        parser.print_help()
-        sys.exit(0)
+    a = sub.add_parser("check-upstream", parents=[common_up], help="检查上游有没有新 commit")
+    a.add_argument("--force", action="store_true", help="无条件认为有更新")
+    a.add_argument("--build-on-error", action="store_true",
+                   help="API 出错时也认为需要构建（默认不构建）")
+    a.add_argument("--trigger-build", action="store_true", help="检测到更新就直接触发构建")
+    a.add_argument("--json", default="", help="把检测结果另存一份 JSON（给工作流同一 step 里读）")
+    a.set_defaults(func=cmd_check_upstream)
 
-    if args.notify:
-        do_notify(args.status, args.artifact_url)
+    b = sub.add_parser("save-state", parents=[common_up], help="记录本次构建的 commit")
+    b.add_argument("--kernel-commit", default="")
+    b.add_argument("--kernel-branch", default="")
+    b.add_argument("--kernel-repo", default="")
+    b.add_argument("--initramfs-commit", default="")
+    b.add_argument("--boot-img-sha256", default="")
+    b.add_argument("--rootfs-sha256", default="")
+    b.add_argument("--run-url", default="")
+    b.add_argument("--ref", default=os.environ.get("GITHUB_REF_NAME", "main"))
+    b.add_argument("--no-push", action="store_true", help="只写本地文件，不推回仓库")
+    b.set_defaults(func=cmd_save_state)
 
-    if args.check_update:
-        do_check_update(auto_build=args.auto_build, commit_patch=args.commit_patch)
+    c = sub.add_parser("trigger", help="触发 GitHub Actions 构建")
+    c.add_argument("--workflow", default=DEFAULT_WORKFLOW)
+    c.add_argument("--ref", default=os.environ.get("GITHUB_REF_NAME", "main"))
+    c.add_argument("--task", default="")
+    c.add_argument("--rootfs-type", default="")
+    c.add_argument("--kernel-commit", default="")
+    c.add_argument("--usb-gadget", default="")
+    c.set_defaults(func=cmd_trigger)
+
+    d = sub.add_parser("notify", help="推送构建结果通知")
+    d.add_argument("--status", default="success",
+                   choices=["success", "failure", "cancelled"])
+    d.add_argument("--task", default="")
+    d.add_argument("--kernel-branch", default="")
+    d.add_argument("--kernel-commit", default="")
+    d.add_argument("--rootfs-type", default="")
+    d.add_argument("--artifact-url", default="")
+    d.add_argument("--details", default="")
+    d.add_argument("--markdown", action="store_true", help="Server酱用 markdown")
+    d.add_argument("--strict", action="store_true", help="所有渠道都失败时返回非零")
+    d.set_defaults(func=cmd_notify)
+
+    e = sub.add_parser("verify-bootimg", help="校验 boot.img 头部（v4 / pagesize / 段大小）")
+    e.add_argument("image", help="boot.img 路径")
+    e.set_defaults(func=cmd_verify_bootimg)
+
+    g = sub.add_parser("inspect-image", help="读裸 Image 的版本串 + 内嵌 .config")
+    g.add_argument("image", help="Image 路径")
+    g.add_argument("--keys", nargs="*", default=None, help="要打印的 CONFIG_* 列表")
+    g.add_argument("--assert-y", nargs="*", default=None, help="这些项必须 =y，否则返回非零")
+    g.add_argument("--dump", default="", help="把完整 .config 写到指定文件")
+    g.set_defaults(func=cmd_inspect_image)
+
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # 同时兼容 `bot.py --notify ...`（老的连字符风格）和子命令风格
+    legacy = {"--notify": "notify", "--check-upstream": "check-upstream",
+              "--save-state": "save-state", "--trigger": "trigger"}
+    if argv and argv[0] in legacy:
+        argv = [legacy[argv[0]]] + argv[1:]
+
+    p = build_parser()
+    args = p.parse_args(argv)
+    if not getattr(args, "func", None):
+        p.print_help()
+        return 2
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
