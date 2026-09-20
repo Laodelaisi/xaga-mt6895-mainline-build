@@ -54,6 +54,29 @@ name: Build xaga mainline (boot.img + rootfs.img)
 #     换成真目录 -> chroot 直接 "No such file or directory"。必须解到 rootfs/usr。
 #
 # -----------------------------------------------------------------------------
+#  §kver 内核版本串 —— 目标 uname -a = Linux 7.2.0-xaga-mt6895 ...
+#
+#  上游编出来是 7.2.0-g007893e66767。Makefile 里
+#  `filechk_kernel.release = $(srctree)/scripts/setlocalversion $(srctree)` 每次都跑，
+#  而 setlocalversion 的判断是：
+#       CONFIG_LOCALVERSION_AUTO=y   -> 补 -g<sha>
+#       AUTO 关 + LOCALVERSION 未设   -> 补 "+"（工作树不干净还会变 -dirty）
+#       AUTO 关 + LOCALVERSION 已设   -> 尾巴干净
+#  所以 config 步骤里三条一起做：清空 CONFIG_LOCALVERSION（新版 xaga.config 里是
+#  "-linux-nahida"）+ 关 AUTO + 把 LOCALVERSION 写进 $GITHUB_ENV 供后续 make 继承。
+#  值取自本文件顶层 env 的 KERNEL_LOCALVERSION。build job 会拿
+#  include/config/kernel.release 和 Image 里的 "Linux version" 各断言一次。
+#
+# -----------------------------------------------------------------------------
+#  §connlog 内核刷屏 —— "[connlog] wifi_mcu / wifi_fw cache is full."
+#
+#  connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读（conninfra/Kbuild
+#  里 -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH 是无条件加的，所以默认就是这种模式），
+#  没人读就永远满 -> ratelimit(10s) 无限打警告。安卓侧有 MTK 的 daemon 在读，
+#  我们这套 rootfs 没有。修法：rootfs-overlay/ 里的 xaga-connlog-drain 常驻读走
+#  /dev/fw_log_*（不需要重编内核）。rootfs job 会把它铺进 rootfs 并开机自启。
+#
+# -----------------------------------------------------------------------------
 # 与 postmarketOS wiki 对齐的打包参数
 #   https://wiki.postmarketos.org/wiki/Xiaomi_Redmi_Note_11T_Pro_(%2B)
 #   base=0x3fff8000 kernel_offset=0x8000 pagesize=4096
@@ -281,6 +304,8 @@ env:
   KERNEL_REPO_URL: 'https://github.com/MT6895-Mainline/linux.git'
   INITRAMFS_REPO_URL: 'https://github.com/MT6895-Mainline/initramfs.git'
   INITRAMFS_BRANCH: 'xaga-mt6895'
+  # ---- 内核版本串后缀（uname -a 显示 7.2.0-xaga-mt6895，见 §kver 注释）----
+  KERNEL_LOCALVERSION: '-xaga-mt6895'
   # ---- bot.py 上游检测用（变量名就是 bot.py 读的那几个）----
   UPSTREAM_REPO: 'MT6895-Mainline/linux'
   INITRAMFS_REPO: 'MT6895-Mainline/initramfs'
@@ -500,6 +525,7 @@ jobs:
     outputs:
       kernel_commit: ${{ steps.kout.outputs.kernel_commit }}
       initramfs_commit: ${{ steps.kout.outputs.initramfs_commit }}
+      kernel_release: ${{ steps.kout.outputs.kernel_release }}
     steps:
       - name: Checkout 本仓库（要 usb-debug/ 里的 kernel fragment）
         uses: actions/checkout@v4
@@ -652,7 +678,43 @@ jobs:
             --disable CONFIG_SND_SOC_SOF_MT8186 \
             --disable CONFIG_SND_SOC_SOF_MT8195
 
+          # ---- 内核版本串：uname -a 里那段，目标是 7.2.0-xaga-mt6895 ----
+          #
+          # 版本串 = KERNELVERSION + CONFIG_LOCALVERSION + 环境变量 LOCALVERSION + SCM 串。
+          # Makefile 里 `filechk_kernel.release = $(srctree)/scripts/setlocalversion $(srctree)`
+          # 是**每次都跑**的（跟开关无关），而 setlocalversion 的判断是：
+          #
+          #   if grep -q "^CONFIG_LOCALVERSION_AUTO=y$" include/config/auto.conf; then
+          #       scm_version="$(scm_version)"          # -> -g<sha>[-dirty]
+          #   elif [ "${LOCALVERSION+set}" != "set" ]; then
+          #       scm_version="$(scm_version --short)"  # -> "+"
+          #   fi
+          #
+          # 所以三条缺一不可，缺任何一条都会得到 7.2.0-g<sha> 或 7.2.0-xaga-mt6895+：
+          #   1) 关 CONFIG_LOCALVERSION_AUTO
+          #   2) 清空 CONFIG_LOCALVERSION（新版 xaga.config 里是 "-linux-nahida"）
+          #   3) 把 LOCALVERSION 放进环境变量（哪怕是空串）——setlocalversion 判的是
+          #      "${LOCALVERSION+set}"，「被设置过」就行；这里直接写进 $GITHUB_ENV，
+          #      后面所有 make（Image / modules / modules_install）都会继承。
+          ./scripts/config --set-str CONFIG_LOCALVERSION "" || true
+          if ! grep -qx 'CONFIG_LOCALVERSION=""' .config; then
+            if grep -q '^CONFIG_LOCALVERSION=' .config; then
+              sed -i 's|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=""|' .config
+            else
+              printf 'CONFIG_LOCALVERSION=""\n' >> .config
+            fi
+          fi
+          ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
+          echo "LOCALVERSION=${KERNEL_LOCALVERSION}" >> "$GITHUB_ENV"
+
           make ARCH=arm64 LLVM=1 olddefconfig
+
+          # 版本串断言：编之前先把 .config 验一遍
+          grep -qx 'CONFIG_LOCALVERSION=""' .config || {
+            echo "::error::CONFIG_LOCALVERSION 不是空串: $(grep -m1 '^CONFIG_LOCALVERSION=' .config || echo 缺失)"; exit 1; }
+          grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' .config || {
+            echo "::error::CONFIG_LOCALVERSION_AUTO 没关掉（尾巴会变成 -g<sha>）"; exit 1; }
+          echo "内核版本串将生成: $(make -s ARCH=arm64 kernelversion)${KERNEL_LOCALVERSION}"
 
           echo "=== 关键配置 ==="
           grep -E '^CONFIG_(OF|BLK_DEV_INITRD|RD_LZ4|CONFIGFS_FS|MODULES|IKCONFIG|LZ4)=' .config || true
@@ -691,6 +753,26 @@ jobs:
           echo "OK: _binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_xaga_dtb_start 存在"
           ls -lh arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb || \
             echo "::warning::独立 dtb 未生成（已内嵌，属正常）"
+
+      # 版本串不对的话，刷完机才会在 uname -a 里发现，还不如现在就失败。
+      # （注意：这里不能用 heredoc —— run: | 块里的 heredoc 终止符会被 YAML 缩进，
+      #   bash 认不出，直接语法错。所以全用 python3 -c 单行形式。）
+      - name: "[boot] 校验内核版本串（uname -a 里那段）"
+        if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
+        working-directory: linux
+        run: |
+          set -e
+          WANT="$(make -s ARCH=arm64 kernelversion)${KERNEL_LOCALVERSION}"
+          echo "期望版本串 : $WANT"
+          test -f include/config/kernel.release || { echo "::error::缺 include/config/kernel.release"; exit 1; }
+          GOT="$(cat include/config/kernel.release)"
+          echo "kernel.release: $GOT"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::内核版本串不对：期望 $WANT，实际 $GOT（检查 CONFIG_LOCALVERSION_AUTO / CONFIG_LOCALVERSION / LOCALVERSION）"
+            exit 1
+          fi
+          python3 -c "d=open('arch/arm64/boot/Image','rb').read(); i=d.find(b'Linux version '); print('    Image 里:', d[i:i+96].split(b'\n')[0].decode('utf-8','replace') if i>=0 else '(未找到 Linux version 串)')"
+          echo "OK: 版本串是 $WANT"
 
       # 内核 Image 已编完 —— 就以此刻作为「编译完成时间」，本 job 所有产物都带上它。
       # 注意：reuse 模式下前面的编译步骤被跳过，这一步仍然要跑，所以不能加 if。
@@ -844,6 +926,8 @@ jobs:
           {
             echo "kernel_commit=${KERNEL_COMMIT:-${{ needs.meta.outputs.kernel_commit }}}"
             echo "initramfs_commit=${INITRAMFS_COMMIT:-${{ needs.meta.outputs.initramfs_commit }}}"
+            # 内核版本串（uname -a 里那段）。reuse 模式下没有源码树，就空着。
+            echo "kernel_release=$(cat linux/include/config/kernel.release 2>/dev/null || true)"
           } >> "$GITHUB_OUTPUT"
 
       - name: "[boot] 上传 boot 产物"
@@ -1240,6 +1324,26 @@ jobs:
           sudo chmod 600 rootfs/etc/NetworkManager/system-connections/xaga-usb0.nmconnection 2>/dev/null || true
           echo "USB gadget 文件已铺入"
 
+      # 治内核里那句无限刷屏的 "[connlog] xxx cache is full."
+      #   conninfra 的 connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读；
+      #   conninfra/Kbuild 里 -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH 是无条件加的，
+      #   所以默认就是 LOG_TO_FILE（等用户态）。安卓有 MTK 的 connsys_log daemon 在读，
+      #   我们这套 Arch/Debian/Ubuntu rootfs 没有 -> 缓存永远满 -> 内核按 10s ratelimit
+      #   一直打警告（实测一份日志 1110 条）。修法就是自己把 /dev/fw_log_* 读掉。
+      - name: 铺 connsyslog 排水服务（消掉 [connlog] cache is full 刷屏）
+        if: ${{ env.ROOTFS_TYPE != 'postmarketOS' }}
+        run: |
+          set -e
+          SRC="$GITHUB_WORKSPACE/rootfs-overlay"
+          [ -d "$SRC" ] || { echo "::warning::找不到 $SRC，跳过"; exit 0; }
+          sudo cp -a "$SRC/." rootfs/
+          sudo chmod 755 rootfs/usr/local/sbin/xaga-connlog-drain
+          sudo chmod 644 rootfs/etc/systemd/system/xaga-connlog-drain.service
+          sudo mkdir -p rootfs/etc/systemd/system/multi-user.target.wants
+          sudo ln -sf /etc/systemd/system/xaga-connlog-drain.service \
+            rootfs/etc/systemd/system/multi-user.target.wants/xaga-connlog-drain.service
+          echo "connsyslog 排水服务已铺入（开机自启，读 /dev/fw_log_* 并丢弃，设备晚出现也能自愈）"
+
       - name: 预置 WiFi（可选）
         if: ${{ env.ROOTFS_TYPE != 'postmarketOS' && needs.meta.outputs.wifi_ssid != '' }}
         env:
@@ -1441,6 +1545,8 @@ jobs:
           内核分支   : ${{ needs.meta.outputs.kernel_branch }}
           内核 commit: ${KC:-（复用的历史产物 / 本次未构建）}
           initramfs  : ${IC:-（本次未构建）}
+          内核版本串 : ${{ needs.kernel.outputs.kernel_release || '（复用/未构建）' }}
+                       ^ 开机后 uname -a 会显示 Linux <这个版本串> ...
           打包参数   : base=$KERNEL_BASE kernel_offset=$KERNEL_OFFSET pagesize=$PAGESIZE
                        ramdisk_offset=$RAMDISK_OFFSET tags_offset=$TAGS_OFFSET
                        header_version=$HEADER_VERSION os_version=$OS_VERSION
@@ -1454,6 +1560,22 @@ jobs:
           主机名   : ${{ needs.meta.outputs.hostname }}
           初始容量 : ${{ needs.meta.outputs.image_size_gb }}GB
           用户     : 仅 root / ${{ needs.meta.outputs.root_password }}（登录后请立刻 passwd 改掉）
+
+          ============================================================
+           开机后该知道的两件事（日志相关的坑，已在构建里处理）
+          ============================================================
+          * [connlog] wifi_mcu / wifi_fw cache is full.  无限刷屏（实测一份日志 1110 条）
+              connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读，没人读就一直满，
+              内核按 10s ratelimit 无限打警告。安卓有 MTK 的 daemon 在读，我们的 rootfs 没有。
+              rootfs 里已装 xaga-connlog-drain（开机自启）：把 /dev/fw_log_* 读走即可，
+              不需要重编内核。排查: systemctl status xaga-connlog-drain
+              想临时看那条警告: systemctl stop xaga-connlog-drain
+
+          * SCP 每 ~3 分钟崩一次（scp_crash_dump / scp_aed TIMEOUT / IPI #29 timeout /
+            MBOX Error / sensorhub 每 3 分钟重新注册 32 个传感器）
+              这是上游 SCP 集成的问题，与本构建流程无关。上游 2026-09-20 的
+              cb1a1483f15d（PR #15 "fix SCP integration build failures after VCP merge"）
+              已修 SCP 集成；kernel commit 比它旧就重跑一次这里即可。
 
           ============================================================
            怎么用
