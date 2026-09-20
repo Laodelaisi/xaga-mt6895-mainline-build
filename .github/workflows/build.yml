@@ -1,4 +1,4 @@
-name: Build xaga mainline (boot.img + rootfs.img)
+name: Build xaga mainline
 
 # =============================================================================
 # Redmi Note 11T Pro (xaga / MT6895 / 天玑8100) 主线内核一站式构建
@@ -75,6 +75,19 @@ name: Build xaga mainline (boot.img + rootfs.img)
 #  没人读就永远满 -> ratelimit(10s) 无限打警告。安卓侧有 MTK 的 daemon 在读，
 #  我们这套 rootfs 没有。修法：rootfs-overlay/ 里的 xaga-connlog-drain 常驻读走
 #  /dev/fw_log_*（不需要重编内核）。rootfs job 会把它铺进 rootfs 并开机自启。
+#
+# -----------------------------------------------------------------------------
+#  §bootimg 打包器必须用 AOSP 官方 mkbootimg（v4 头的 header_size 必须是 1584）
+#
+#  osm0sis 那版是 C 实现，mkbootimg.c 的 v3+ 分支用的是 boot_img_hdr_v3 结构体：
+#      hdr.header_size    = sizeof(hdr);      // 恒为 1580，它没有 v4 结构
+#      hdr.header_version = header_version;   // 却照写你传的 --header_version 4
+#  → 产出「header_version=4 + header_size=1580」的畸形 v4 头（刷不进去）。
+#  改用 Ubuntu 的 mkbootimg 包（= AOSP 官方 python 脚本；AOSP 里
+#  BOOT_IMAGE_HEADER_V4_SIZE=1584，v4 走的就是它）。该 deb 漏装了脚本模块级
+#  import 的 gki/，用 PYTHONPATH 塞一个 stub 让 import 过去即可（我们不签名）。
+#  装好后先拿两个随机小文件冒烟打一次包，确认 header_size=1584 再往下走 ——
+#  否则要等内核编完 20 分钟，才在「校验 boot.img 头部」那步炸掉。
 #
 # -----------------------------------------------------------------------------
 # 与 postmarketOS wiki 对齐的打包参数
@@ -557,16 +570,102 @@ jobs:
           for t in llvm-ar llvm-nm llvm-objcopy llvm-strip ld.lld; do "$t" --version | head -1; done
           ccache -M "${CCACHE_MAXSIZE}" && ccache -z
 
-      - name: 编译安装 mkbootimg（osm0sis C 版，去掉 -Werror 兼容新 GCC）
+      # ------------------------------------------------------------------
+      # 打包工具必须用 AOSP 官方 mkbootimg（= Ubuntu 的 mkbootimg 包）
+      #
+      #   osm0sis 那版是 **C 实现**，它的 v3+ 分支用的是 boot_img_hdr_v3 结构体：
+      #       boot_img_hdr_v3 hdr;
+      #       hdr.header_size    = sizeof(hdr);      // 恒为 1580，它没有 v4 结构
+      #       hdr.header_version = header_version;   // 却照写你传的 --header_version 4
+      #   → 产出「header_version=4 + header_size=1580」的畸形 v4 头。
+      #   v4 = v3 再接一个 uint32 signature_size，规范值必须是 1584
+      #   （AOSP: BOOT_IMAGE_HEADER_V4_SIZE = 1584，write_header_v3_and_above 里
+      #     header_version>3 就用它）。
+      #
+      #   Ubuntu 的包就是 AOSP 官方 python 脚本，但 deb 里漏装了它模块级 import 的
+      #   gki/（dpkg -L mkbootimg 只有 /usr/bin/{mkbootimg,unpack_bootimg}），
+      #   直接跑会 ModuleNotFoundError: No module named 'gki'。
+      #   我们不做 GKI 签名（不传 --gki_signing_key），塞个 stub 让 import 过去即可。
+      # ------------------------------------------------------------------
+      - name: 准备 AOSP 版 mkbootimg（官方 python 实现 + gki stub）
         run: |
           set -e
-          git clone --depth=1 https://github.com/osm0sis/mkbootimg.git mkbootimg
-          cd mkbootimg
-          sed -i 's/-Werror//g' Makefile libmincrypt/Makefile 2>/dev/null || true
-          make
-          sudo cp mkbootimg /usr/local/bin/
-          sudo chmod +x /usr/local/bin/mkbootimg
-          mkbootimg 2>&1 | head -3 || true
+          sudo apt-get install -y --no-install-recommends mkbootimg
+
+          SHIM="$RUNNER_TEMP/mkbootimg-shim"
+          mkdir -p "$SHIM/gki"
+          : > "$SHIM/gki/__init__.py"
+          cat > "$SHIM/gki/generate_gki_certificate.py" <<'PYEOF'
+          """Stub 替代 AOSP 的 gki.generate_gki_certificate（deb 没打这个包）。
+
+          真实现只在 mkbootimg 收到 --gki_signing_key 时才会被调用；本仓库
+          不签名，这里只要让模块级 import 成功。万一真被调用就明确报错，
+          而不是静默产出一个坏镜像。
+          """
+
+
+          def generate_gki_certificate(*args, **kwargs):
+              raise NotImplementedError(
+                  "本环境未提供 GKI 签名实现；本仓库不需要 GKI 签名。"
+              )
+          PYEOF
+
+          # 后面所有步骤都要用（打包、以及可能的排错），写进 GITHUB_ENV 让 shim 常驻
+          echo "PYTHONPATH=$SHIM" >> "$GITHUB_ENV"
+
+          export PYTHONPATH="$SHIM"
+          mkbootimg --help >/dev/null 2>&1 \
+            || { echo "::error::mkbootimg 不可用"; mkbootimg --help; exit 1; }
+          echo "mkbootimg : $(command -v mkbootimg)"
+          echo "python3   : $(python3 --version)"
+          mkbootimg --help 2>&1 | grep -E "header_version|pagesize|dtb_offset" || true
+
+      - name: 冒烟测试 mkbootimg（先证明它写得出规范 v4 头）
+        run: |
+          set -e
+          # 拿两个随机小文件真打一次包：2 秒就能确认打包器没问题，
+          # 否则要等内核编完 20 分钟才发现 header_size 不是 1584。
+          D="$RUNNER_TEMP/mkboot-smoke"
+          rm -rf "$D"; mkdir -p "$D"; cd "$D"
+
+          head -c 1048576 /dev/urandom > Image.gz
+          head -c   65536 /dev/urandom > ramdisk.lz4
+
+          mkbootimg \
+            --kernel Image.gz \
+            --ramdisk ramdisk.lz4 \
+            --base            "$KERNEL_BASE" \
+            --kernel_offset   "$KERNEL_OFFSET" \
+            --pagesize        "$PAGESIZE" \
+            --ramdisk_offset  "$RAMDISK_OFFSET" \
+            --tags_offset     "$TAGS_OFFSET" \
+            --dtb_offset      "$DTB_OFFSET" \
+            --header_version  "$HEADER_VERSION" \
+            --os_version      "$OS_VERSION" \
+            --os_patch_level  "$OS_PATCH_LEVEL" \
+            -o smoke.img
+
+          python3 - <<'PY'
+          import struct, sys
+          # boot_img_hdr：0x08 kernel_size / 0x0c ramdisk_size / 0x14 header_size
+          #               0x28 header_version（v4 的 header_size 必须是 1584）
+          d = open('smoke.img', 'rb').read(4096)
+          if d[:8] != b'ANDROID!':
+              print('!! magic 异常: %r' % d[:8]); sys.exit(1)
+          ksize = struct.unpack_from('<I', d, 0x08)[0]
+          rsize = struct.unpack_from('<I', d, 0x0c)[0]
+          hsize = struct.unpack_from('<I', d, 0x14)[0]
+          hver  = struct.unpack_from('<I', d, 0x28)[0]
+          print('  kernel_size    : %d' % ksize)
+          print('  ramdisk_size   : %d' % rsize)
+          print('  header_size    : %d  (v4 应为 1584)' % hsize)
+          print('  header_version : %d' % hver)
+          if hver != 4:
+              print('!! header_version 应为 4，实际 %d' % hver); sys.exit(1)
+          if hsize != 1584:
+              print('!! header_size 应为 1584，实际 %d' % hsize); sys.exit(1)
+          print('OK: 打包工具可产出规范 v4 头')
+          PY
 
       # ---- 复用历史 run 的 boot.img（省 20~30 分钟）----
       - name: "[reuse] 复用历史 run 的 boot.img"
@@ -587,6 +686,8 @@ jobs:
           BOOT=$(ls out/boot-*.img 2>/dev/null | head -1 || true)
           [ -n "$BOOT" ] || { echo "::error::复用的 run 里没有 boot-*.img"; exit 1; }
           echo "复用产物: $BOOT"
+          # 严格校验：复用的历史产物也必须是规范 v4 头，不合格就直接失败，
+          # 别把一个刷不进去的 boot.img 一路带到 Release。
           python3 .github/bot.py verify-bootimg "$BOOT"
 
       - name: "[boot] 拉取内核源码"
@@ -875,6 +976,8 @@ jobs:
             mkbootimg "$@"
           fi
           ls -lh "$BOOT_IMG"
+          # 头部规范性（v4 → header_version=4 + header_size=1584）由下游
+          # 「[boot] 校验 boot.img 头部」一步断言；打包器本身已在冒烟测试里验过。
 
           # boot.img -> .gz：存档 / 发网盘 / release 下载都省流量；
           # 刷机仍然用 .img 本体（fastboot 不认 .gz）。
@@ -886,9 +989,14 @@ jobs:
       - name: "[boot] 校验 boot.img 头部（v4 必须 header_size=1584）"
         run: |
           set -e
-          # reuse 模式没有 STAMP，退化成从目录里挑（artifact 里只会有一个）
-          BOOT="${BOOT_IMG:-}"
-          [ -n "$BOOT" ] || BOOT=$(ls out/boot-*.img | head -1)
+          # 这一步在 reuse 模式下也必须跑（要校验复用的历史产物），所以不能加 if。
+          # 非 reuse 模式直接用打包步骤写进环境变量的 BOOT_IMG；
+          # reuse 模式没有 BOOT_IMG/STAMP，就从 out/ 里挑（artifact 里只会有一个）。
+          shopt -s nullglob
+          IMGS=(out/boot-*.img)
+          shopt -u nullglob
+          [ ${#IMGS[@]} -gt 0 ] || { echo "::error::out/ 里没有 boot-*.img（打包步骤被跳过？产物没上传？）"; exit 1; }
+          BOOT="${BOOT_IMG:-${IMGS[0]}}"
           echo "校验: $BOOT"
           python3 .github/bot.py verify-bootimg "$BOOT"
 
@@ -914,9 +1022,13 @@ jobs:
         run: |
           set -e
           cd out
-          sha256sum "boot-${STAMP}.img" "boot-${STAMP}.img.gz" \
-                    "Image-${STAMP}.gz" "initramfs-${STAMP}.cpio.lz4" \
-                    > "SHA256SUMS-${STAMP}.txt"
+          # 用 glob 而不是拼 ${STAMP}：reuse 模式下产物名带的是历史 run 的戳，
+          # 拿本次的 STAMP 去拼文件名会直接 "No such file or directory"。
+          shopt -s nullglob
+          FILES=(boot-*.img boot-*.img.gz Image-*.gz initramfs-*.cpio.lz4)
+          shopt -u nullglob
+          [ ${#FILES[@]} -gt 0 ] || { echo "::error::out/ 里没有 boot 产物"; exit 1; }
+          sha256sum "${FILES[@]}" > "SHA256SUMS-${STAMP}.txt"
           cat "SHA256SUMS-${STAMP}.txt"
 
       - name: "[boot] 记录 commit（供下游 job 引用）"
@@ -1476,10 +1588,27 @@ jobs:
           name: kernel-modules
           path: out
 
+      - name: 检查产物（空目录时给出明确原因）
+        run: |
+          set -e
+          mkdir -p out
+          ls -la out
+          N=$(ls -A out | wc -l)
+          echo "产物文件数: $N"
+          if [ "$N" -eq 0 ]; then
+            echo "::error::out/ 是空的 —— kernel-output / rootfs-output / kernel-modules 三个 artifact 一个都没下到。"
+            echo "::error::上面三个下载步骤都是 continue-on-error，artifact 不存在时它们只会跳过（不报错），"
+            echo "::error::然后压缩步骤才会以 'cd: out: No such file or directory' 这种看不懂的方式炸掉 —— 就是这个守卫在防的事。"
+            echo "::error::常见原因：上游 kernel / rootfs job 失败（job 失败就不会走 upload-artifact），"
+            echo "::error::或本次 TASK 没包含对应构建项。先去上面几个 job 的日志里找第一个 error。"
+            exit 1
+          fi
+
       - name: 压缩产物（pigz，超 2GB 自动分卷）
         if: ${{ needs.meta.outputs.compress == '1' }}
         run: |
           set -e
+          mkdir -p out
           cd out
           shopt -s nullglob
           # 产物名带时间戳，直接遍历目录里的 .img（boot-<戳>.img / rootfs-<戳>.img /
