@@ -1,0 +1,125 @@
+name: Release From Run
+
+# 补发 Release: 只把某次已完成的 Run 里上传的 Artifacts 下载下来并发布,
+# 不重新编译 (build.yml 的 release job 挂了 / 忘了勾发布 / 产物还在 Artifacts 里时用这个)。
+#
+# 用法: Actions -> Release From Run -> Run workflow
+#   run_id: 那次构建的运行 ID (例如 35607108156, 在 Actions 页面 URL 里)
+#   tag:    Release tag, 留空自动生成 build-<UTC 时间>
+#
+# 注意: Artifacts 有保留期 (默认 90 天), 过期就只能重跑 build.yml。
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '要补发的 Actions Run ID (例如 35607108156)'
+        required: true
+        default: ''
+        type: string
+      tag:
+        description: 'Release tag, 留空自动生成 build-<时间戳>'
+        required: false
+        default: ''
+        type: string
+      source_repo:
+        description: '产物所在仓库 OWNER/REPO, 留空用当前仓库'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write   # 创建 Release
+  actions: read     # 读 Actions Artifacts
+
+concurrency:
+  group: release-from-run
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 补发 Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # gh release create 要 git 仓库上下文, 没有就报:
+      # failed to run git: fatal: not a git repository
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载该 Run 的产物
+        run: |
+          set -euo pipefail
+          run_id="${{ inputs.run_id }}"
+          # 纯数字校验: 输入会直接拼进 shell, 别放任意字符串进来
+          case "$run_id" in
+            ''|*[!0-9]*) echo "::error::run_id 必须是纯数字 (Actions 页面 URL 里那串): '$run_id'"; exit 1 ;;
+          esac
+          src="${{ inputs.source_repo }}"
+          [ -n "$src" ] || src="${{ github.repository }}"
+          echo "来源: $src  run: $run_id"
+          mkdir -p out
+          # 每个 artifact 落到 out/<artifact 名>/ 下
+          gh run download "$run_id" -R "$src" -D out
+          echo "--- 下载到的文件 ---"
+          find out -type f | sort
+          [ -n "$(find out -type f -print -quit)" ] || { echo "::error::这次 Run 里没有任何 artifact (可能已过期或被清理)"; exit 1; }
+
+      - name: 写 Release 说明
+        run: |
+          set -euo pipefail
+          cat > NOTES.md <<EOF
+          ## xaga 补发构建 (Run ${{ inputs.run_id }})
+
+          - 来源运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.run_id }}
+          - 上游内核: [MT6895-Mainline/linux](https://github.com/MT6895-Mainline/linux) / initramfs: [MT6895-Mainline/initramfs](https://github.com/MT6895-Mainline/initramfs)
+
+          ### 刷写
+          \`\`\`bash
+          # MTK v4 boot header 不支持 fastboot boot, 必须刷到对应槽位
+          fastboot flash boot boot-<时间戳>.img
+          fastboot flash rootfs rootfs-sparse-<时间戳>.img
+          fastboot reboot
+          \`\`\`
+
+          > 若 rootfs 产物是 \`.gz.part-00/.gz.part-01\` 分卷, 先合并:
+          > \`cat rootfs-sparse-<时间戳>.img.gz.part-* > rootfs-sparse-<时间戳>.img.gz\`
+
+          ### 首次开机
+          \`\`\`bash
+          resize2fs /dev/sdc86   # 撑满 userdata
+          \`\`\`
+          EOF
+
+      - name: 创建 Release
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="build-$(date -u +'%Y%m%d-%H%M%S')"
+          else
+            case "$tag" in
+              *[!A-Za-z0-9._-]*) echo "::error::tag 只能含字母数字 . _ - : '$tag'"; exit 1 ;;
+            esac
+          fi
+          repo="${{ github.repository }}"
+          # GitHub Release 单文件上限 2GB: 超限的留在 Action Artifacts 里
+          mapfile -t files < <(find out -type f -size -2000000000c | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::没有可发布的产物 (单文件上限 2GB, 大文件请从 Action Artifacts 下载)"
+            exit 1
+          fi
+          printf '%s\n' "${files[@]}"
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "Release $tag 已存在, 改成追加上传"
+            gh release upload "$tag" "${files[@]}" --repo "$repo" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --repo "$repo" \
+              --title "xaga 构建 $tag (补发)" \
+              --notes-file NOTES.md
+          fi
+          echo "Release: ${{ github.server_url }}/$repo/releases/tag/$tag"
