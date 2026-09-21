@@ -680,7 +680,16 @@ jobs:
     env:
       PUBLISH: ${{ inputs.publish_release }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
     steps:
+      # gh release create 必须在 git 仓库里跑 (它要 git remote 推断仓库 / target),
+      # 少了这一步就会报: failed to run git: fatal: not a git repository
+      - name: 检出仓库
+        if: ${{ env.PUBLISH == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: 下载全部产物
         if: ${{ env.PUBLISH == 'true' }}
         uses: actions/download-artifact@v4
@@ -723,6 +732,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="build-${{ needs.prepare.outputs.ts }}"
+          repo="${GH_REPO}"
           # GitHub Release 单文件上限 2GB: 超限的大文件留在 Action Artifacts 里
           mapfile -t files < <(find out -maxdepth 1 -type f -size -2000000000c | sort)
           if [ "${#files[@]}" -eq 0 ]; then
@@ -730,9 +740,15 @@ jobs:
             exit 1
           fi
           printf '%s\n' "${files[@]}"
-          gh release create "$tag" "${files[@]}" \
-            --title "xaga 构建 ${{ needs.prepare.outputs.ts }} (${{ needs.prepare.outputs.short_target }})" \
-            --notes-file NOTES.md
+          # --repo 显式给, 别让 gh 去猜 (工作目录不是 git 仓库时会直接炸)
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "Release $tag 已存在, 改成追加上传 (--clobber 覆盖同名文件)"
+            gh release upload "$tag" "${files[@]}" --repo "$repo" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --repo "$repo" \
+              --title "xaga 构建 ${{ needs.prepare.outputs.ts }} (${{ needs.prepare.outputs.short_target }})" \
+              --notes-file NOTES.md
+          fi
           echo "Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
 
   # ---------------------------------------------------------------------------
