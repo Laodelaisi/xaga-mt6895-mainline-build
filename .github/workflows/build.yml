@@ -734,11 +734,24 @@ jobs:
           tag="build-${{ needs.prepare.outputs.ts }}"
           repo="${GH_REPO}"
           # GitHub Release 单文件上限 2GB: 超限的大文件留在 Action Artifacts 里
-          mapfile -t files < <(find out -maxdepth 1 -type f -size -2000000000c | sort)
+          mapfile -t allfiles < <(find out -maxdepth 1 -type f -size -2000000000c | sort)
+          # Release 不允许同名 asset (422 ReleaseAsset.name already exists), 按 basename 去重
+          declare -A seen=()
+          files=()
+          for f in "${allfiles[@]}"; do
+            b="$(basename "$f")"
+            if [ -z "${seen[$b]:-}" ]; then
+              seen[$b]="$f"
+              files+=("$f")
+            else
+              echo "跳过同名: $f (已选 ${seen[$b]})"
+            fi
+          done
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::没有可发布的产物 (单文件上限 2GB, 大文件请从 Action Artifacts 下载)"
             exit 1
           fi
+          echo "--- 待发布 (${#files[@]} 个) ---"
           printf '%s\n' "${files[@]}"
           # --repo 显式给, 别让 gh 去猜 (工作目录不是 git 仓库时会直接炸)
           if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
