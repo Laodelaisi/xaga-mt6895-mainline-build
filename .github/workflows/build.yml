@@ -1,0 +1,796 @@
+name: Build Boot
+
+# xaga (Redmi Note 11T Pro / MT6895 / 天玑8100) 主线内核 + RootFS 构建
+# boot 头部参数与 postmarketOS wiki 保持一致, 见 README「Boot镜像头部参数」
+on:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: '构建任务: boot=仅构建Boot镜像 / rootfs=仅构建RootFS镜像 / all=构建Boot镜像和RootFS镜像'
+        required: true
+        default: 'boot'
+        type: choice
+        options: ['boot', 'rootfs', 'all']
+      kernel_branch:
+        description: '内核分支: 7.2 功能最新 / 6.18 更保守'
+        required: true
+        default: '7.2-mt6895-xiaomi-xaga'
+        type: choice
+        options:
+          - '7.2-mt6895-xiaomi-xaga'
+          - '6.18-mt6895-xiaomi-xaga'
+      initramfs_userdata:
+        description: 'initramfs userdata 设备节点 (xaga 上是 /dev/sdc86 = userdata, 不是 fastboot 分区名, 别乱改)'
+        required: true
+        default: '/dev/sdc86'
+        type: string
+      initramfs_nvdata:
+        description: 'initramfs NVRAM 分区 (xaga 是 /dev/sdc13, 取 WiFi/BT NVRAM)'
+        required: true
+        default: '/dev/sdc13'
+        type: string
+      build_kernel:
+        description: 'kernel: 需要编译就打勾; 取消勾选则复用 RUNS ID 的内核产物 (没填 RUNS ID 就按默认编译)'
+        required: false
+        default: true
+        type: boolean
+      build_initramfs:
+        description: 'initramfs: 需要编译就打勾; 取消勾选则复用 RUNS ID 的 initramfs 产物 (没填 RUNS ID 就按默认编译)'
+        required: false
+        default: true
+        type: boolean
+      reuse_run_id:
+        description: 'RUNS ID: 留空=正常编译内核和initramfs; 填 35342958852 则按上面开关复用该 Run 的 Image-<时间戳>.gz 和 initramfs-<时间戳>.cpio.lz4'
+        required: false
+        default: ''
+        type: string
+      build_modules:
+        description: 'modules: 需要编译就打勾 (BUILD_MODULES 开着时默认打勾), 否则复用 RUNS ID 的内核模块产物'
+        required: false
+        default: true
+        type: boolean
+      rootfs_distro:
+        description: 'rootfs 发行版: arch=Arch Linux ARM / debian=Debian 13 / ubuntu=Ubuntu 26.04 LTS'
+        required: true
+        default: 'ubuntu'
+        type: choice
+        options: ['arch', 'debian', 'ubuntu']
+      arch_desktop:
+        description: 'Arch Linux ARM 的桌面环境 (仅 rootfs 发行版选 arch 时生效)'
+        required: true
+        default: 'kde'
+        type: choice
+        options: ['kde', 'none', 'phosh', 'sway']
+      rootfs_size:
+        description: 'rootfs 初始镜像容量 (GB, 纯数字): 6 够用, 完整桌面 10~16; 刷入后首次开机 resize2fs 撑满 userdata'
+        required: true
+        default: '6'
+        type: string
+      rootfs_hostname:
+        description: 'rootfs 主机名'
+        required: true
+        default: 'xaga'
+        type: string
+      rootfs_root_password:
+        description: 'rootfs root 密码'
+        required: true
+        default: 'root'
+        type: string
+      rootfs_extra_packages:
+        description: 'rootfs 额外包: 空格分隔 (Arch 用包名)'
+        required: false
+        default: ''
+        type: string
+      wifi_ssid:
+        description: 'rootfs 预置 WiFi 名称 (留空不预置)'
+        required: false
+        default: ''
+        type: string
+      wifi_password:
+        description: 'rootfs 预置 WiFi 密码 (留空不预置)'
+        required: false
+        default: ''
+        type: string
+      collect_artifacts:
+        description: '汇总产物: 汇总所有产物并做 Release 前的收尾'
+        required: false
+        default: true
+        type: boolean
+      publish_release:
+        description: '发布 Release: 发布到 GitHub Release (永久资源, 不过期)'
+        required: false
+        default: true
+        type: boolean
+      send_notification:
+        description: '构建完成推送通知 (喵提醒 / Server酱)'
+        required: false
+        default: true
+        type: boolean
+
+  # 每日两次自动检测上游内核 / initramfs 更新, 有更新则 bot.py 自动触发一次 boot 构建
+  schedule:
+    - cron: '0 0,12 * * *'
+
+permissions:
+  contents: write   # Release / 提交上游记录
+  actions: write    # 触发构建 / 清理缓存
+
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 上游更新检测 (仅 schedule 触发): bot.py 对比 build-state.json, 有更新就自动触发构建
+  # ---------------------------------------------------------------------------
+  upstream-check:
+    name: 检测上游更新
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 检测上游内核 / initramfs 更新
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          KERNEL_BRANCH: 7.2-mt6895-xiaomi-xaga
+        run: python3 .github/bot.py --check-update --auto-build --commit-patch
+
+  # ---------------------------------------------------------------------------
+  # 参数归一化: 时间戳 / 构建目标 / 复用 Run ID
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: 准备参数
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      ts: ${{ steps.vars.outputs.ts }}
+      target: ${{ steps.vars.outputs.target }}
+      short_target: ${{ steps.vars.outputs.short_target }}
+    steps:
+      - name: 计算时间戳与构建目标
+        id: vars
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TARGET: ${{ inputs.build_target }}
+        run: |
+          set -euo pipefail
+          echo "ts=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+          if [ "${EVENT}" = "workflow_dispatch" ] && [ -n "${INPUT_TARGET}" ]; then
+            target="${INPUT_TARGET}"
+          else
+            target="boot"
+          fi
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+          case "${target}" in
+            boot)   echo "short_target=Boot镜像" >> "$GITHUB_OUTPUT" ;;
+            rootfs) echo "short_target=RootFS镜像" >> "$GITHUB_OUTPUT" ;;
+            *)      echo "short_target=Boot镜像+RootFS镜像" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "本次任务: ${target}"
+
+  # ---------------------------------------------------------------------------
+  # Boot 镜像: initramfs + 内核(Clang 18 / LLVM=1) + mkbootimg v4 打包
+  # ---------------------------------------------------------------------------
+  build-boot:
+    name: 构建 Boot 镜像
+    needs: prepare
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.target != 'rootfs' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      ARCH: arm64
+      TS: ${{ needs.prepare.outputs.ts }}
+      KERNEL_REPO: MT6895-Mainline/linux
+      INITRAMFS_REPO: MT6895-Mainline/initramfs
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      BUILD_KERNEL: ${{ inputs.build_kernel }}
+      BUILD_INITRAMFS: ${{ inputs.build_initramfs }}
+      BUILD_MODULES: ${{ inputs.build_modules }}
+      REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+      BOOT_PARTITION: ${{ inputs.initramfs_userdata }}
+      NVDATA_PARTITION: ${{ inputs.initramfs_nvdata }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/share/swift /usr/local/.ghcup /usr/local/share/boost || true
+          df -h / | tail -1
+
+      - name: 安装编译依赖 (Clang 18 / LLVM)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang-18 lld-18 llvm-18 \
+            flex bison bc libssl-dev libelf-dev libncurses-dev \
+            cpio lz4 xz-utils zstd kmod rsync pigz git curl ca-certificates \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          # LLVM=1 会直接调 clang / ld.lld / llvm-*, 统一建软链到 /usr/local/bin
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump \
+                   llvm-readelf llvm-strip llvm-size llvm-ranlib; do
+            for p in /usr/bin /usr/lib/llvm-18/bin; do
+              if [ -x "$p/$t-18" ]; then sudo ln -sf "$p/$t-18" "/usr/local/bin/$t"; break; fi
+              if [ -x "$p/$t" ];    then sudo ln -sf "$p/$t"    "/usr/local/bin/$t"; break; fi
+            done
+          done
+          hash -r
+          clang --version | head -1
+          ld.lld --version | head -1
+          clang --version | head -1 | grep -q 'clang version 18' \
+            || { echo "::error::需要 Clang 18 (README: Clang 18 全链路编译, 禁用 GCC)"; exit 1; }
+
+      - name: 准备 mkbootimg (保证 v4 header_size=1584)
+        run: |
+          set -euo pipefail
+          smoke() {
+            local cmd="$1" out="/tmp/smoke-boot.img"
+            head -c 4096 /dev/zero > /tmp/smoke-k.gz
+            head -c 8192 /dev/zero > /tmp/smoke-r.cpio
+            rm -f "$out"
+            if ! $cmd --kernel /tmp/smoke-k.gz --ramdisk /tmp/smoke-r.cpio \
+                  --base 0x3fff8000 --kernel_offset 0x8000 --pagesize 4096 \
+                  --ramdisk_offset 0x26f08000 --tags_offset 0x07c88000 --dtb_offset 0x07c88000 \
+                  --header_version 4 --os_version 16.0.0 --os_patch_level 2026-08 \
+                  -o "$out" >/tmp/smoke.log 2>&1; then
+              echo "smoke 打包失败:"; tail -20 /tmp/smoke.log
+              return 1
+            fi
+            local hs ver
+            ver=$(od -An -tu4 -j40 -N4 "$out" | tr -d ' ')
+            hs=$(od -An -tu4 -j20 -N4 "$out" | tr -d ' ')
+            echo "smoke: header_version=${ver} header_size=${hs} (期望 4 / 1584)"
+            [ "$ver" = "4" ] && [ "$hs" = "1584" ]
+          }
+          CMD=""
+          if sudo git clone --depth 1 --quiet \
+               https://android.googlesource.com/platform/system/tools/mkbootimg /opt/mkbootimg 2>/dev/null \
+             && smoke "python3 /opt/mkbootimg/mkbootimg.py"; then
+            CMD="python3 /opt/mkbootimg/mkbootimg.py"
+          elif sudo apt-get install -y -qq mkbootimg >/dev/null 2>&1 \
+             && smoke "$(command -v mkbootimg)"; then
+            CMD="$(command -v mkbootimg)"
+          else
+            echo "::error::拿不到能产出 v4 (header_size=1584) 的 mkbootimg。"
+            echo "::error::osm0sis C 版只实现到 boot_img_hdr_v3 (header_size 恒 1580), 会产出畸形头, 不能用。"
+            exit 1
+          fi
+          echo "MKBOOTIMG_CMD=${CMD}" >> "$GITHUB_ENV"
+          echo "使用打包器: ${CMD}"
+
+      - name: 复用 RUNS ID 的内核 Image
+        if: ${{ env.REUSE_RUN_ID != '' && env.BUILD_KERNEL != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p out reuse/kernel
+          gh run download "${REUSE_RUN_ID}" -R "${{ github.repository }}" -n kernel-image -D reuse/kernel
+          src=$(ls -1t reuse/kernel/Image-*.gz | head -1)
+          cp "$src" "out/Image-${TS}.gz"
+          echo "复用内核产物: $src -> out/Image-${TS}.gz"
+
+      - name: 复用 RUNS ID 的 initramfs
+        if: ${{ env.REUSE_RUN_ID != '' && env.BUILD_INITRAMFS != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p out reuse/initramfs
+          gh run download "${REUSE_RUN_ID}" -R "${{ github.repository }}" -n initramfs-image -D reuse/initramfs
+          src=$(ls -1t reuse/initramfs/initramfs-*.cpio.lz4 | head -1)
+          cp "$src" "out/initramfs-${TS}.cpio.lz4"
+          echo "复用 initramfs 产物: $src -> out/initramfs-${TS}.cpio.lz4"
+
+      - name: 复用 RUNS ID 的内核模块
+        if: ${{ env.REUSE_RUN_ID != '' && env.BUILD_MODULES != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p out reuse/modules
+          gh run download "${REUSE_RUN_ID}" -R "${{ github.repository }}" -n kernel-modules -D reuse/modules
+          src=$(ls -1t reuse/modules/modules-*.tar.gz | head -1)
+          cp "$src" "out/modules-${TS}.tar.gz"
+          echo "复用模块产物: $src -> out/modules-${TS}.tar.gz"
+
+      - name: 恢复内核编译缓存
+        if: ${{ env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '' }}
+        uses: actions/cache@v4
+        with:
+          # 内核源码树 + 编译产物 (obj), 配合下面的 fetch/checkout 做增量编译
+          path: linux
+          key: kernel-${{ inputs.kernel_branch || '7.2-mt6895-xiaomi-xaga' }}-${{ github.run_id }}
+          restore-keys: |
+            kernel-${{ inputs.kernel_branch || '7.2-mt6895-xiaomi-xaga' }}-
+
+      - name: 编译 initramfs
+        if: ${{ env.BUILD_INITRAMFS == 'true' || env.REUSE_RUN_ID == '' }}
+        env:
+          CROSS_COMPILE: aarch64-linux-gnu-
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          git clone --depth 1 "https://github.com/${INITRAMFS_REPO}.git" initramfs
+          cd initramfs
+          make clean || true
+          # BOOT_PARTITION = userdata (xaga 上是 /dev/sdc86), NVDATA_PARTITION = nvdata (/dev/sdc13)
+          make BOOT_PARTITION="${BOOT_PARTITION:-/dev/sdc86}" \
+               NVDATA_PARTITION="${NVDATA_PARTITION:-/dev/sdc13}"
+          ls -l initramfs.cpio.lz4
+          cp initramfs.cpio.lz4 "../out/initramfs-${TS}.cpio.lz4"
+
+      - name: 编译内核 (Clang 18 / LLVM=1)
+        if: ${{ env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          branch="${KERNEL_BRANCH:-7.2-mt6895-xiaomi-xaga}"
+          if [ -d linux/.git ]; then
+            git -C linux remote set-url origin "https://github.com/${KERNEL_REPO}.git"
+            git -C linux fetch --depth 1 origin "$branch"
+            git -C linux checkout -f FETCH_HEAD
+          else
+            git clone --depth 1 --branch "$branch" "https://github.com/${KERNEL_REPO}.git" linux
+          fi
+          cd linux
+          ARCH=arm64 scripts/kconfig/merge_config.sh \
+            arch/arm64/configs/defconfig arch/arm64/configs/xaga.config
+          make ARCH=arm64 LLVM=1 olddefconfig
+          make ARCH=arm64 LLVM=1 -j"$(nproc --all)" Image
+          gzip -n -9 -c arch/arm64/boot/Image > "../out/Image-${TS}.gz"
+          ls -l "../out/Image-${TS}.gz"
+
+      - name: 编译内核模块
+        if: ${{ (env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '') && (env.BUILD_MODULES == 'true' || env.REUSE_RUN_ID == '') }}
+        run: |
+          set -euo pipefail
+          cd linux
+          make ARCH=arm64 LLVM=1 -j"$(nproc --all)" modules
+          make ARCH=arm64 LLVM=1 INSTALL_MOD_PATH="$PWD/modout" INSTALL_MOD_STRIP=1 modules_install
+          rm -f modout/lib/modules/*/build modout/lib/modules/*/source
+          tar -C modout -czf "../out/modules-${TS}.tar.gz" lib
+          ls -l "../out/modules-${TS}.tar.gz"
+
+      - name: 打包 boot.img (MTK v4 头)
+        run: |
+          set -euo pipefail
+          test -f "out/Image-${TS}.gz"
+          test -f "out/initramfs-${TS}.cpio.lz4"
+          # 头部参数必须与 postmarketOS wiki / README 一致, 别乱改
+          # DTB 已 objcopy 链进 vmlinux, 所以不传 --dtb, 也不要拼 Image+dtb
+          $MKBOOTIMG_CMD \
+            --kernel "out/Image-${TS}.gz" \
+            --ramdisk "out/initramfs-${TS}.cpio.lz4" \
+            --base 0x3fff8000 --kernel_offset 0x8000 --pagesize 4096 \
+            --ramdisk_offset 0x26f08000 --tags_offset 0x07c88000 --dtb_offset 0x07c88000 \
+            --header_version 4 --os_version 16.0.0 --os_patch_level 2026-08 \
+            -o "out/boot-${TS}.img"
+          ls -l "out/boot-${TS}.img"
+
+      - name: 校验 boot.img 头部 (v4 / header_size=1584)
+        run: python3 .github/bot.py --verify-bootimg "out/boot-${TS}.img"
+
+      - name: 上传 boot 镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-image
+          path: out/boot-*.img
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: 上传内核 Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image
+          path: out/Image-*.gz
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: 上传 initramfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: initramfs-image
+          path: out/initramfs-*.cpio.lz4
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: 上传内核模块
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-modules
+          path: out/modules-*.tar.gz
+          if-no-files-found: warn
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # RootFS: Arch Linux ARM / Debian 13 / Ubuntu 26.04 LTS, 只有 root 用户
+  # ---------------------------------------------------------------------------
+  build-rootfs:
+    name: 构建 RootFS 镜像
+    needs: prepare
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.target != 'boot' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      TS: ${{ needs.prepare.outputs.ts }}
+      DISTRO: ${{ inputs.rootfs_distro }}
+      ARCH_DESKTOP: ${{ inputs.arch_desktop }}
+      IMG_SIZE: ${{ inputs.rootfs_size }}
+      ROOTFS_HOSTNAME: ${{ inputs.rootfs_hostname }}
+      ROOTFS_PASSWORD: ${{ inputs.rootfs_root_password }}
+      EXTRA_PKGS: ${{ inputs.rootfs_extra_packages }}
+      WIFI_SSID: ${{ inputs.wifi_ssid }}
+      WIFI_PASSWORD: ${{ inputs.wifi_password }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/share/swift /usr/local/.ghcup /usr/local/share/boost || true
+          df -h / | tail -1
+
+      - name: 安装 rootfs 构建依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debootstrap qemu-user-static binfmt-support \
+            e2fsprogs parted android-sdk-libsparse-utils pigz libarchive-tools \
+            wget curl rsync xz-utils zstd
+          sudo update-binfmts --enable qemu-aarch64 || true
+
+      - name: 构建 rootfs 文件树
+        run: |
+          set -euo pipefail
+          sudo rm -rf rootfs mnt
+          sudo mkdir -p rootfs
+          case "${DISTRO:-ubuntu}" in
+            arch)
+              echo "::group::下载 Arch Linux ARM aarch64 rootfs tarball"
+              wget -q -O /tmp/alarm.tar.gz \
+                "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+              sudo bsdtar -xpf /tmp/alarm.tar.gz -C rootfs
+              echo "::endgroup::"
+              ;;
+            debian|ubuntu)
+              if [ "${DISTRO}" = "ubuntu" ]; then
+                suite=resolute
+                mirror=http://ports.ubuntu.com/ubuntu-ports
+                comps=main,universe
+              else
+                suite=trixie
+                mirror=http://deb.debian.org/debian
+                comps=main,universe,non-free-firmware
+              fi
+              echo "::group::debootstrap ${suite} (arm64, --foreign)"
+              sudo debootstrap --arch=arm64 --foreign --components="${comps}" \
+                "${suite}" rootfs "${mirror}"
+              sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+              sudo cp /etc/resolv.conf rootfs/etc/resolv.conf
+              sudo chroot rootfs /debootstrap/debootstrap --second-stage
+              echo "::endgroup::"
+              ;;
+            *)
+              echo "::error::未知 rootfs 发行版: ${DISTRO}"; exit 1 ;;
+          esac
+          sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/ 2>/dev/null || true
+          sudo cp /etc/resolv.conf rootfs/etc/resolv.conf
+          echo "rootfs 文件树: $(sudo du -sh rootfs | cut -f1)"
+
+      - name: 配置 rootfs (root 用户 / 主机名 / WiFi / 固件 / 额外包)
+        run: |
+          set -euo pipefail
+          sudo tee rootfs/tmp/xaga-setup.sh >/dev/null <<'SETUP'
+          #!/bin/bash
+          # xaga rootfs 配置: 只有 root 用户, 不创建普通用户
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          HOSTNAME="$1"; ROOT_PASS="$2"; WIFI_SSID="$3"; WIFI_PASS="$4"; EXTRA="$5"; DESKTOP="$6"
+
+          printf '%s\n' "$HOSTNAME" > /etc/hostname
+          printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n' "$HOSTNAME" > /etc/hosts
+
+          # root 密码; 只保留 root 用户
+          echo "root:${ROOT_PASS}" | chpasswd
+
+          if [ -f /etc/pacman.conf ]; then
+            DISTRO_FAMILY=arch
+          else
+            DISTRO_FAMILY=debian
+          fi
+
+          if [ "$DISTRO_FAMILY" = "arch" ]; then
+            pacman-key --init || true
+            pacman-key --populate archlinuxarm || true
+            pacman -Syu --noconfirm systemd sudo networkmanager openssh \
+              nano vim less htop iproute2 iw wireless_tools wpa_supplicant dialog || true
+            # Arch: 桌面环境
+            case "$DESKTOP" in
+              kde)  pacman -S --noconfirm plasma-meta sddm konsole dolphin || true ;;
+              phosh) pacman -S --noconfirm phosh || true ;;
+              sway) pacman -S --noconfirm sway || true ;;
+              none|*) : ;;
+            esac
+            # MediaTek 固件 (WiFi/蓝牙/声卡/触控)
+            pacman -S --noconfirm linux-firmware || true
+            [ -n "$EXTRA" ] && pacman -S --noconfirm $EXTRA || true
+          else
+            apt-get update
+            apt-get install -y --no-install-recommends systemd systemd-sysv sudo \
+              openssh-server network-manager wpa-supplicant iproute2 iw wireless-tools \
+              less nano vim htop dialog ca-certificates || true
+            # MediaTek 固件 (README: rootfs 必须补 mediatek 固件, 否则 WiFi/蓝牙/声卡/触控全废)
+            apt-get install -y --no-install-recommends firmware-mediatek \
+              || echo "warn: firmware-mediatek 装不上, 开机后自己补"
+            [ -n "$EXTRA" ] && apt-get install -y --no-install-recommends $EXTRA || true
+            apt-get clean
+          fi
+
+          # 预置 WiFi (留空不预置)
+          if [ -n "$WIFI_SSID" ]; then
+            mkdir -p /etc/wpa_supplicant
+            printf 'ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\nupdate_config=1\ncountry=CN\n\nnetwork={\n\tssid="%s"\n\tpsk="%s"\n}\n' \
+              "$WIFI_SSID" "$WIFI_PASS" > /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+            mkdir -p /etc/NetworkManager/system-connections
+            printf '[connection]\nid=xaga-wifi\ntype=wifi\nautoconnect=true\n\n[wifi]\nssid=%s\nmode=infrastructure\n\n[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n' \
+              "$WIFI_SSID" "$WIFI_PASS" > /etc/NetworkManager/system-connections/xaga-wifi.nmconnection
+            chmod 600 /etc/NetworkManager/system-connections/xaga-wifi.nmconnection
+            systemctl enable NetworkManager.service || true
+            systemctl enable wpa_supplicant@wlan0.service || true
+          fi
+
+          systemctl enable sshd.service 2>/dev/null || systemctl enable ssh.service || true
+          echo "xaga-setup done: $(cat /etc/os-release | head -2 | tr '\n' ' ')"
+          SETUP
+          sudo chmod +x rootfs/tmp/xaga-setup.sh
+          # 挂载伪文件系统, 让 systemd / 包管理器能在 chroot 里工作
+          sudo mount -t proc /proc rootfs/proc
+          sudo mount --rbind /sys rootfs/sys
+          sudo mount --rbind /dev rootfs/dev
+          sudo chroot rootfs /usr/bin/env -i \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /bin/bash /tmp/xaga-setup.sh \
+            "${ROOTFS_HOSTNAME:-xaga}" "${ROOTFS_PASSWORD:-root}" \
+            "${WIFI_SSID:-}" "${WIFI_PASSWORD:-}" "${EXTRA_PKGS:-}" "${ARCH_DESKTOP:-kde}"
+          sudo rm -f rootfs/tmp/xaga-setup.sh
+          sudo umount -R rootfs/dev || true
+          sudo umount -R rootfs/sys || true
+          sudo umount -R rootfs/proc || true
+
+      - name: 生成 ext4 镜像并填充 rootfs
+        run: |
+          set -euo pipefail
+          size="${IMG_SIZE:-6}"
+          case "$size" in (*[!0-9]*) echo "::error::rootfs 容量必须是纯数字 (GB)"; exit 1 ;; esac
+          sudo truncate -s "${size}G" "rootfs-${TS}.img"
+          sudo mkfs.ext4 -F -L xaga-rootfs "rootfs-${TS}.img"
+          mkdir -p mnt
+          sudo mount -o loop "rootfs-${TS}.img" mnt
+          sudo rsync -aHAX --numeric-ids rootfs/ mnt/
+          # 刷入后首次开机 resize2fs 撑满 userdata: resize2fs /dev/sdc86
+          sudo umount mnt
+          sudo chown "$(id -u):$(id -g)" "rootfs-${TS}.img"
+          ls -lh "rootfs-${TS}.img"
+
+      - name: 转 sparse 镜像 + pigz 压缩 (超 2GB 自动分卷)
+        run: |
+          set -euo pipefail
+          img2simg "rootfs-${TS}.img" "rootfs-sparse-${TS}.img"
+          rm -f "rootfs-${TS}.img"
+          # -k: 保留 sparse 原图 (README 产物 rootfs-sparse-<时间戳>.img)
+          pigz -9 -k -p"$(nproc)" "rootfs-sparse-${TS}.img"
+          ls -lh "rootfs-sparse-${TS}.img.gz"
+          bytes=$(stat -c%s "rootfs-sparse-${TS}.img.gz")
+          if [ "$bytes" -gt 2000000000 ]; then
+            split -b 1900M -d -a 2 "rootfs-sparse-${TS}.img.gz" "rootfs-sparse-${TS}.img.gz.part-"
+            rm -f "rootfs-sparse-${TS}.img.gz"
+            echo "已分卷 (Release 单文件上限 2GB), 合并: cat rootfs-sparse-${TS}.img.gz.part-* > rootfs-sparse-${TS}.img.gz"
+          fi
+          ls -lh rootfs-sparse-${TS}* || true
+
+      - name: 上传 rootfs 镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-sparse
+          path: rootfs-sparse-${{ needs.prepare.outputs.ts }}*
+          if-no-files-found: error
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # 汇总产物 (Release 前收尾)
+  # ---------------------------------------------------------------------------
+  collect:
+    name: 汇总产物
+    needs: [prepare, build-boot, build-rootfs]
+    if: ${{ always() && !failure() && !cancelled() && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      COLLECT: ${{ inputs.collect_artifacts }}
+    steps:
+      - name: 判断是否需要汇总
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${COLLECT:-true}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 下载全部产物
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: 生成 SHA256SUMS 与构建信息
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: |
+          set -euo pipefail
+          cd out
+          ls -lh
+          sha256sum -- * > SHA256SUMS
+          {
+            echo "xaga-mt6895-mainline-build"
+            echo "Run ID:   ${{ github.run_id }}"
+            echo "构建任务: ${{ needs.prepare.outputs.short_target }}"
+            echo "内核分支: ${{ inputs.kernel_branch }}"
+            echo "rootfs:   ${{ inputs.rootfs_distro }} (桌面: ${{ inputs.arch_desktop }})"
+            echo "时间:     $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "刷写:"
+            echo "  fastboot flash boot boot-<时间戳>.img"
+            echo "  fastboot flash rootfs rootfs-sparse-<时间戳>.img"
+            echo "  fastboot reboot"
+            echo "  首次开机后: resize2fs /dev/sdc86"
+          } > BUILD-INFO.txt
+          cat BUILD-INFO.txt
+
+      - name: 上传汇总产物
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-artifacts
+          path: out/*
+          if-no-files-found: error
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # 发布 Release (永久资源, 不过期)
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布 Release
+    needs: [prepare, build-boot, build-rootfs]
+    if: ${{ always() && !failure() && !cancelled() && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PUBLISH: ${{ inputs.publish_release }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 下载全部产物
+        if: ${{ env.PUBLISH == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: 写 Release 说明
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          set -euo pipefail
+          cat > NOTES.md <<EOF
+          ## xaga 自动构建 ${{ needs.prepare.outputs.ts }}
+
+          - 构建任务: ${{ needs.prepare.outputs.short_target }}
+          - 内核分支: \`${{ inputs.kernel_branch }}\`
+          - rootfs: \`${{ inputs.rootfs_distro }}\` / 桌面 \`${{ inputs.arch_desktop }}\` / 容量 ${{ inputs.rootfs_size }}G
+          - 上游内核: [MT6895-Mainline/linux](https://github.com/MT6895-Mainline/linux) / initramfs: [MT6895-Mainline/initramfs](https://github.com/MT6895-Mainline/initramfs)
+          - 运行记录: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### 刷写
+          \`\`\`bash
+          # MTK v4 boot header 不支持 fastboot boot, 必须刷到对应槽位
+          fastboot flash boot boot-<时间戳>.img
+          fastboot flash rootfs rootfs-sparse-<时间戳>.img
+          fastboot reboot
+          \`\`\`
+
+          > 若 rootfs 产物是 \`.gz.part-00/.gz.part-01\` 分卷, 先合并:
+          > \`cat rootfs-sparse-<时间戳>.img.gz.part-* > rootfs-sparse-<时间戳>.img.gz\`
+
+          ### 首次开机
+          \`\`\`bash
+          resize2fs /dev/sdc86   # 撑满 userdata
+          \`\`\`
+          EOF
+
+      - name: 创建 Release
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          set -euo pipefail
+          tag="build-${{ needs.prepare.outputs.ts }}"
+          # GitHub Release 单文件上限 2GB: 超限的大文件留在 Action Artifacts 里
+          mapfile -t files < <(find out -maxdepth 1 -type f -size -2000000000c | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::没有可发布的产物 (单文件上限 2GB, 大文件请从 Action Artifacts 下载)"
+            exit 1
+          fi
+          printf '%s\n' "${files[@]}"
+          gh release create "$tag" "${files[@]}" \
+            --title "xaga 构建 ${{ needs.prepare.outputs.ts }} (${{ needs.prepare.outputs.short_target }})" \
+            --notes-file NOTES.md
+          echo "Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
+
+  # ---------------------------------------------------------------------------
+  # 构建完成推送通知 (喵提醒 / Server酱)
+  # ---------------------------------------------------------------------------
+  notify:
+    name: 构建完成通知
+    needs: [prepare, upstream-check, build-boot, build-rootfs, collect, release]
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SEND_NOTIFY: ${{ inputs.send_notification }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 判断是否需要推送通知
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${SEND_NOTIFY:-true}" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 推送构建结果
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        env:
+          MEOW_WEBHOOK: ${{ secrets.MEOW_WEBHOOK }}
+          MEOW_SECRET: ${{ secrets.MEOW_SECRET }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          status="success"
+          for r in "${{ needs.upstream-check.result }}" "${{ needs.build-boot.result }}" \
+                   "${{ needs.build-rootfs.result }}" "${{ needs.collect.result }}" \
+                   "${{ needs.release.result }}"; do
+            case "$r" in
+              failure) status="failure" ;;
+              cancelled) [ "$status" = "success" ] && status="cancelled" ;;
+            esac
+          done
+          msg="任务: ${{ needs.prepare.outputs.short_target }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            msg="${msg}
+          rootfs: ${{ inputs.rootfs_distro }} / ${{ inputs.arch_desktop }} / ${{ inputs.rootfs_size }}G
+          Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/build-${{ needs.prepare.outputs.ts }}"
+          else
+            msg="上游更新检测: (${{ needs.upstream-check.result }}) 检测到更新会自动触发 Boot 构建"
+          fi
+          python3 .github/bot.py \
+            --notify \
+            --status "$status" \
+            --title "xaga 构建$( [ "$status" = "success" ] && echo '成功 ✅' || echo '失败 ❌' )" \
+            --artifact-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --message "$msg"
