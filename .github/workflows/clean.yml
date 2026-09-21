@@ -1,39 +1,80 @@
 name: Clean Cache
 
+# 编译异常或缓存冲突时: Actions -> Clean Cache -> Run workflow
+# 一键清空全部 Actions 缓存 (内核 obj / 编译缓存)
 on:
   workflow_dispatch:
+    inputs:
+      cache_key:
+        description: '要清理的缓存 key (留空 = 清空全部缓存)'
+        required: false
+        default: ''
+        type: string
+      clean_artifacts:
+        description: 'GC: 同时删除本仓库的历史构建产物 (Artifacts, Release 不受影响)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: write   # 删除 cache / artifact
+  contents: read
 
 jobs:
   clean:
-    name: 清空全部Actions缓存
-    runs-on: ubuntu-latest
+    name: 清理缓存
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      CACHE_KEY: ${{ inputs.cache_key }}
+      CLEAN_ARTIFACTS: ${{ inputs.clean_artifacts }}
     steps:
-      - name: 删除所有缓存条目
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            console.log(`开始清理 ${owner}/${repo} 的 Actions 缓存...`);
-            let total = 0;
-            let page = 1;
-            while (true) {
-              const { data } = await github.rest.actions.getActionsCacheList({
-                owner, repo, per_page: 100, page
-              });
-              const caches = data.actions_caches || [];
-              if (caches.length === 0) break;
-              for (const cache of caches) {
-                try {
-                  await github.rest.actions.deleteActionsCacheById({
-                    owner, repo, cache_id: cache.id
-                  });
-                  console.log(`  已删除: [${cache.id}] ${cache.key} (${(cache.size_in_bytes / 1024 / 1024).toFixed(1)} MB)`);
-                  total++;
-                } catch (e) {
-                  console.log(`  跳过: ${cache.key} - ${e.message}`);
-                }
-              }
-              page++;
-              if (caches.length < 100) break;
-            }
-            console.log(`\n清理完成，共删除 ${total} 条缓存。`);
+      - name: 清理前缓存列表
+        run: |
+          set -euo pipefail
+          gh cache list -R "$REPO" -L 100 || echo "warn: 读取缓存列表失败"
+          echo "----"
+          gh cache list -R "$REPO" -L 100 --json key,sizeInBytes \
+            -q 'length as $n | "缓存条目: \($n)"' || true
+
+      - name: 清空缓存
+        run: |
+          set -euo pipefail
+          if [ -n "${CACHE_KEY:-}" ]; then
+            echo "只清理 key = ${CACHE_KEY} 的缓存"
+            gh cache delete "$CACHE_KEY" -R "$REPO" --confirm || echo "warn: ${CACHE_KEY} 不存在或删除失败"
+          else
+            echo "清空全部 Actions 缓存"
+            gh cache delete --all -R "$REPO" --confirm || echo "warn: 没有可删除的缓存"
+          fi
+
+      - name: 清理后确认
+        run: |
+          set -euo pipefail
+          remaining=$(gh cache list -R "$REPO" -L 100 --json key -q 'length' || echo "?")
+          echo "剩余缓存条目: ${remaining}"
+          {
+            echo "### Clean Cache 完成 🧹"
+            echo ""
+            echo "- 仓库: \`${REPO}\`"
+            echo "- 清理范围: \`$( [ -n "${CACHE_KEY:-}" ] && echo "$CACHE_KEY" || echo "全部缓存" )\`"
+            echo "- 剩余缓存条目: \`${remaining}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 清理历史构建产物 (可选)
+        if: ${{ env.CLEAN_ARTIFACTS == 'true' }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api "repos/${REPO}/actions/artifacts?per_page=100" --paginate \
+                  -q '.artifacts[].id' || true)
+          if [ -z "$ids" ]; then
+            echo "没有历史产物"
+            exit 0
+          fi
+          count=0
+          for id in $ids; do
+            gh api -X DELETE "repos/${REPO}/actions/artifacts/${id}" >/dev/null && count=$((count+1)) || true
+          done
+          echo "已删除产物 ${count} 个 (Release 资源是永久的, 不在这里)"
