@@ -7,14 +7,20 @@ name: Build xaga mainline
 # build-xaga-all-in-one）的功能全部合并到这里，其余已删除。
 #
 # 一次运行可以产出（**文件名一律带构建时间戳 YYYYmmdd-HHMMSS，不覆盖历史**）：
-#   boot-<戳>.img / boot-<戳>.img.gz   主线内核 + 自编 initramfs（含 USB 串口/RNDIS gadget）
-#   Image-<戳> / Image-<戳>.gz         裸内核（打包时用的是它的 .gz）
-#   initramfs-<戳>.cpio[.lz4]          ramdisk
-#   modules-<戳>.tar.gz                内核模块（注入 rootfs 的 /lib/modules）
-#   rootfs-<戳>.img / rootfs-sparse-<戳>.img   postmarketOS / Arch Linux ARM / Ubuntu 三选一
-#   kernel-<戳>.config                 从镜像 IKCFG 抠出的完整 .config
-#   SHA256SUMS-<戳>.txt                校验和
-#   统一压缩（超 2GB 自动分卷）、生成 README、发布到 GitHub Release
+#   boot-<戳>.img                    主线内核 + 自编 initramfs（含 USB 串口/RNDIS gadget）
+#                                    **不压缩** —— 这是唯一能 fastboot flash 的直刷件；
+#                                    内部已是 gzip 的 Image + LZ4 的 ramdisk，再压只省 2%，
+#                                    却会多出一个极易被误刷的 .gz（fastboot 不校验内容）
+#   Image-<戳>                       裸内核（未压缩）。永久存档，同时就是复用的「打包输入」
+#   Image-<戳>.gz                    裸内核的 gz（打包进 boot.img 时用的就是它）
+#   initramfs-<戳>.cpio[.lz4]        ramdisk（同样是复用输入）
+#   modules-<戳>.tar.gz              内核模块（注入 rootfs 的 /lib/modules）
+#   rootfs-sparse-<戳>.img.gz        发行版 rootfs —— **压缩发布**（1.7G -> ~730M，
+#                                    Release 里唯一的大件）；完整 ext4 与未压缩 sparse
+#                                    只在本地脚本产出，CI 里不保留（省数 GB 传输）
+#   kernel-<戳>.config               从镜像 IKCFG 抠出的完整 .config
+#   SHA256SUMS-<戳>.txt              校验和
+#   收尾：boot / Image 保持未压缩、rootfs 压缩、超 2GB 自动分卷，再发到 GitHub Release
 #
 #   时间戳的取法：kernel job 在**内核编译完成、开始打包那一刻**取；
 #   rootfs job 在**开始打 ext4 镜像那一刻**取。所以两个 job 的戳通常不同。
@@ -45,8 +51,12 @@ name: Build xaga mainline
 #   * 设备**不支持 `fastboot boot`**，只能 fastboot flash boot_a / boot_b
 #   * 本工程历史上只 make Image、不 make modules：defconfig 里任何 =m 等于没编
 #     （实测那份镜像里有 1420 个 =m）。所以：
-#       - USB gadget 那组配置在 usb-debug/kernel-fragments 里强制 =y（本工作流硬断言）
+#       - USB gadget 那组配置由 config 步骤用 `./scripts/config --enable` 直接写进 .config
+#         （全部强制 =y，本工作流有硬断言）
 #       - 其它功能要么 =y，要么开 BUILD_MODULES 把模块真编出来并塞进 rootfs
+#   * 本工作流**不依赖仓库里任何附加目录**：gadget 的脚本/服务/udev/NM 文件、connlog
+#     排水服务，全部在 rootfs job 里用 heredoc 内联生成 —— 工作流自身就是唯一事实来源，
+#     不会因为推代码时漏掉某个目录而静默降级（本机没有 .git，漏推很难发现）。
 #   * 生效的 `Kernel command line` 来自内嵌 DTB 的 /chosen/bootargs，不是 boot.img 的
 #     --cmdline；日志 Memory: 5417384K/6291456K 说明内存已经是 6GiB。
 #   * rootfs 必须带 mediatek 固件，否则 WiFi / 蓝牙 / 声卡 / 触控全废
@@ -70,11 +80,22 @@ name: Build xaga mainline
 # -----------------------------------------------------------------------------
 #  §connlog 内核刷屏 —— "[connlog] wifi_mcu / wifi_fw cache is full."
 #
-#  connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读（conninfra/Kbuild
-#  里 -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH 是无条件加的，所以默认就是这种模式），
-#  没人读就永远满 -> ratelimit(10s) 无限打警告。安卓侧有 MTK 的 daemon 在读，
-#  我们这套 rootfs 没有。修法：rootfs-overlay/ 里的 xaga-connlog-drain 常驻读走
-#  /dev/fw_log_*（不需要重编内核）。rootfs job 会把它铺进 rootfs 并开机自启。
+#  connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读（没人读就永远满
+#  -> ratelimit(10s) 无限打警告，实测一份日志 1110 条）。安卓侧有 MTK 的 daemon 在读，
+#  我们这套 rootfs 没有。
+#
+#  ⚠ 光改 .config 是**无效的**：上游把这开关硬编码在构建脚本里，两处无条件打开 ——
+#      drivers/misc/mediatek/connectivity/Makefile
+#          export CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH := y
+#      drivers/misc/mediatek/connectivity/conninfra/Kbuild
+#          ccflags-y += -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH   （宏直接塞给编译器）
+#    于是源码里的 #ifdef 恒为真，connsyslog 那一套照样编进内核。
+#  想让它生效就必须 sed 掉上游那两行 —— 那就是改源码，本工作流不干
+#  （硬规矩：产物必须与上游 commit 一一对应、可复现，runner 上的源码树一个字节都不改）。
+#
+#  ⇒ 解法整个放在**用户态**：rootfs job 内联生成常驻服务 xaga-connlog-drain，
+#    把 /dev/fw_log_* 读走，ring_cache 不积压，pr_warn 自然不再触发。
+#    零源码侵入，而且想复盘那条警告时 `systemctl stop xaga-connlog-drain` 就能请回来。
 #
 # -----------------------------------------------------------------------------
 #  §bootimg 打包器必须用 AOSP 官方 mkbootimg（v4 头的 header_size 必须是 1584）
@@ -125,7 +146,14 @@ on:
           - '7.2-mt6895-xiaomi-xaga'
           - '6.18-mt6895-xiaomi-xaga'
       KERNEL_COMMIT:
-        description: "[内核] 固定 commit（留空 = 取分支 HEAD）"
+        description: |
+          [内核] 固定 commit（留空 = 取分支 HEAD）
+          ⚠ 2026-09-20 起分支 HEAD 带一个「卡第一 logo」的回归：上游 PR14+PR15
+          （b311b740b323 / e9eacef6064a）把 MTK_VCP_RPROC / MTK_SCP / MTK_DVFSRC /
+          REGULATOR_MTK_DVFSRC 一次性从 =m / 无 改成 =y，并改了 DTB 的 vcp / dvfsrc 节点。
+          最后已知可启动的 commit 是 37812e8ab655（PR14 merge 之前）。
+          刷完卡 logo 且已排除 .img.gz 与槽位问题时，先填 37812e8ab655 重编一次二分。
+          详见 README §8.4.1。
         required: false
         default: ''
         type: string
@@ -166,6 +194,23 @@ on:
         required: true
         default: true
         type: boolean
+      MTK_VCP_SCP_AS_MODULE:
+        description: |
+          [内核] 把 MTK_VCP_RPROC / MTK_SCP / RPMSG_MTK_SCP 改回 **模块**（默认开，规避 9-20 启动回归）
+          上游 PR14+PR15（b311b740b323 / e9eacef6064a）把这三个从「=m / 无」一次性改成 =y，
+          并给 DTB 加了 vcp@1ea00000 节点 —— 上游注释说这是为「内建 initramfs」设计的
+          （"the target boots from the embedded initramfs"），本工程走外部 ramdisk，
+          这批早期内建驱动正是「卡第一 logo」的成因 #4（README §8.4.1）。
+          这三个都是 **tristate**，能安全改回 =m，而且比「把 KERNEL_COMMIT 钉回 37812e8ab655」
+          更好：PR15 对 SCP 崩溃的修复在驱动源码里，模块形态照样生效；
+          钉老 commit 会把那个修复一起丢掉（SCP 又变回每 ~3 分钟崩一次）。
+          ⚠ CONFIG_MTK_DVFSRC / CONFIG_REGULATOR_MTK_DVFSRC 不受这个开关影响 ——
+          上游已删掉旧的 MTK6895_DVFSRC_PIN 源码、DTB 也换成了 mediatek,mt6895-dvfsrc 节点，
+          关掉等于 CPU vcore 没人管，谁都别去动它。
+          关掉 = 与上游配置完全一致（刷完又卡 logo 时再回来打开）。
+        required: true
+        default: true
+        type: boolean
       BUILD_MODULES:
         description: |
           [内核] 额外编内核模块并打包 modules.tar.gz（会注入 rootfs 的 /lib/modules）
@@ -181,8 +226,24 @@ on:
         type: string
       REUSE_BOOT_FROM_RUN:
         description: |
-          [内核] 【省时间】复用某个历史 run 已构建好的 boot.img（跳过内核编译）
-          留空 = 正常编译。填 Run ID（数字）即可，例如 35342958852。
+          [内核] 【省时间】复用某个历史 run 的**内核产物**（跳过内核编译）
+          - 留空     : 正常编译内核（默认）
+          - 填 Run ID: 例如 35342958852
+
+          复用的是「打包 boot.img 的**输入**」，不是打好的 boot.img 成品：
+            · Image-*                内核镜像（含已链入的 DTB）
+            · initramfs-*.cpio.lz4   自编 initramfs（已注入 BOOT/NVDATA 分区宏）
+            · modules-*.tar.gz       内核模块（BUILD_MODULES 开着时）
+          拿到这三样后，**boot.img 仍然在本次 run 里重新打包**。好处：
+            · 改打包参数（MEM_LIMIT / OS_VERSION / offset / 换 mkbootimg 工具）会生效；
+              直接搬旧 boot.img 的话，改参数等于没改；
+            · 打包前照样做 v4 头校验 + 内嵌 .config 断言（外部 ramdisk 那两项），
+              历史 Image 带病（比如 CONFIG_INITRAMFS_FORCE=y）会被当场拦下，
+              不会又把一个卡第一 logo 的包发出去；
+            · 打包只要十几秒，省的 20~30 分钟全在内核编译上。
+
+          ⚠️ 前提：那个 run 的 kernel-output 里得有 Image-*。只有 boot.img 可搬。
+          ⚠️ 改了内核源码 / config 时别填它 —— 复用的是旧内核，改了个寂寞。
         required: false
         default: ''
         type: string
@@ -262,12 +323,26 @@ on:
         required: false
         default: ''
         type: string
+      REUSE_ROOTFS_FROM_RUN:
+        description: |
+          [rootfs] 【省时间】复用某个历史 run 已构建好的 rootfs 镜像（跳过 rootfs 构建）
+          留空 = 正常构建。填 Run ID（数字）即可，例如 35342958852。
+          rootfs 刷进 userdata 后长期不用动，反复刷 boot.img 调内核时没必要每次
+          重跑（rootfs 构建 100 分钟起）。填了之后 rootfs job 直接跳过，改由
+          rootfs-reuse job 把那次 run 的 rootfs-output 原样搬过来，
+          本次 Release 里就是「新 boot.img + 旧 rootfs」的组合。
+          产物名里的时间戳保留那次构建的，不会改成本次的（一眼能看出它是旧的）。
+        required: false
+        default: ''
+        type: string
 
       # ---------------- 发布 ----------------
       COMPRESS_ARTIFACTS:
         description: |
-          压缩产物（.img -> .img.gz，省 8~10 倍流量）
-          超过 2GB 会自动分卷成 .gz.part-00 / .gz.part-01 ...
+          汇总产物并做 Release 前的收尾：
+          * boot-<戳>.img / Image-<戳> 保持未压缩（直刷件 + 永久存档的复用输入）
+          * rootfs-sparse 在 rootfs job 里已 pigz 压缩（1.7G -> ~730M）
+          * 单文件超 2GB 自动分卷成 .gz.part-00 / .gz.part-01 ...
         required: true
         default: true
         type: boolean
@@ -351,8 +426,10 @@ jobs:
       mem_limit: ${{ steps.p.outputs.mem_limit }}
       clang_version: ${{ steps.p.outputs.clang_version }}
       usb_gadget: ${{ steps.p.outputs.usb_gadget }}
+      vcp_scp_as_module: ${{ steps.p.outputs.vcp_scp_as_module }}
       build_modules: ${{ steps.p.outputs.build_modules }}
       reuse_boot_from_run: ${{ steps.p.outputs.reuse_boot_from_run }}
+      reuse_rootfs_from_run: ${{ steps.p.outputs.reuse_rootfs_from_run }}
       rootfs_type: ${{ steps.p.outputs.rootfs_type }}
       pmos_ui: ${{ steps.p.outputs.pmos_ui }}
       ubuntu_version: ${{ steps.p.outputs.ubuntu_version }}
@@ -367,7 +444,7 @@ jobs:
       create_release: ${{ steps.p.outputs.create_release }}
       notify: ${{ steps.p.outputs.notify }}
     steps:
-      - name: Checkout 本仓库（要 bot.py 和 usb-debug/）
+      - name: Checkout 本仓库（要 .github/bot.py）
         uses: actions/checkout@v4
 
       - name: 解析参数
@@ -384,8 +461,10 @@ jobs:
           IN_MEM_LIMIT: ${{ inputs.MEM_LIMIT }}
           IN_CLANG_VERSION: ${{ inputs.CLANG_VERSION }}
           IN_USB_GADGET: ${{ inputs.USB_GADGET }}
+          IN_VCP_SCP_AS_MODULE: ${{ inputs.MTK_VCP_SCP_AS_MODULE }}
           IN_BUILD_MODULES: ${{ inputs.BUILD_MODULES }}
           IN_REUSE_BOOT_FROM_RUN: ${{ inputs.REUSE_BOOT_FROM_RUN }}
+          IN_REUSE_ROOTFS_FROM_RUN: ${{ inputs.REUSE_ROOTFS_FROM_RUN }}
           IN_ROOTFS_TYPE: ${{ inputs.ROOTFS_TYPE }}
           IN_PMOS_UI: ${{ inputs.PMOS_UI }}
           IN_UBUNTU_VERSION: ${{ inputs.UBUNTU_VERSION }}
@@ -423,8 +502,10 @@ jobs:
           ML="${IN_MEM_LIMIT:-}"
           CV="${IN_CLANG_VERSION:-18}"
           UG="$([ "${IN_USB_GADGET:-true}" = "true" ] && echo 1 || echo 0)"
+          VS="$([ "${IN_VCP_SCP_AS_MODULE:-true}" = "true" ] && echo 1 || echo 0)"
           BM="$([ "${IN_BUILD_MODULES:-true}" = "true" ] && echo 1 || echo 0)"
           RU="${IN_REUSE_BOOT_FROM_RUN:-}"
+          RUR="${IN_REUSE_ROOTFS_FROM_RUN:-}"
           RT="${IN_ROOTFS_TYPE:-postmarketOS}"
           PU="${IN_PMOS_UI:-phosh}"
           UV="${IN_UBUNTU_VERSION:-26.04 LTS}"
@@ -473,6 +554,14 @@ jobs:
             fi
           fi
 
+          # 复用历史 rootfs 时把 rootfs 构建关掉，改由 rootfs_reuse job 搬运旧产物。
+          # 必须关：同一个 run 里 rootfs 与 rootfs_reuse 若都上传名为 rootfs-output 的
+          # artifact，upload-artifact@v4 会直接 409 报错（同 run 内 artifact 名必须唯一）。
+          if [ -n "$RUR" ]; then
+            DO_ROOTFS=false
+            echo "复用了历史 rootfs（run $RUR）→ 跳过 rootfs 构建，由 rootfs_reuse job 搬运"
+          fi
+
           {
             echo "task=$TASK"
             echo "do_kernel=$DO_KERNEL"
@@ -487,8 +576,10 @@ jobs:
             echo "mem_limit=$ML"
             echo "clang_version=$CV"
             echo "usb_gadget=$UG"
+            echo "vcp_scp_as_module=$VS"
             echo "build_modules=$BM"
             echo "reuse_boot_from_run=$RU"
+            echo "reuse_rootfs_from_run=$RUR"
             echo "rootfs_type=$RT"
             echo "pmos_ui=$PU"
             echo "ubuntu_version=$UV"
@@ -520,6 +611,8 @@ jobs:
             echo "| USB gadget | $UG |"
             echo "| 编内核模块 | $BM |"
             echo "| Clang | $CV |"
+            echo "| 复用内核产物 | ${RU:-（无，本次编译）} |"
+            echo "| 复用 rootfs | ${RUR:-（无，本次构建）} |"
             echo "| RootFS | $RT |"
             echo "| 镜像大小 | ${IS}G |"
             echo "| 压缩产物 | $CP |"
@@ -540,7 +633,7 @@ jobs:
       initramfs_commit: ${{ steps.kout.outputs.initramfs_commit }}
       kernel_release: ${{ steps.kout.outputs.kernel_release }}
     steps:
-      - name: Checkout 本仓库（要 usb-debug/ 里的 kernel fragment）
+      - name: Checkout 本仓库（要 .github/bot.py）
         uses: actions/checkout@v4
 
       - name: 安装依赖 & LLVM 工具链
@@ -568,7 +661,44 @@ jobs:
           done
           clang --version | head -1
           for t in llvm-ar llvm-nm llvm-objcopy llvm-strip ld.lld; do "$t" --version | head -1; done
-          ccache -M "${CCACHE_MAXSIZE}" && ccache -z
+          ccache -M "${CCACHE_MAXSIZE}"
+          ccache --version | head -1
+
+          # ------------------------------------------------------------------
+          # 让 ccache **真的被调用**。
+          #
+          #   内核 make 用的是 LLVM=1 → CC=clang、LD=ld.lld...，全是裸名字走 PATH。
+          #   只在 PATH 里塞一个「全是 ccache 软链」的目录即可，不用改 make 命令行；
+          #   反过来，靠环境变量 CC="ccache clang" 也没用 —— 内核顶层 Makefile 用的是
+          #   = 赋值 + 命令行优先，环境变量会被覆盖掉。
+          #
+          #   不做这一步的话，装了 ccache 也是一次都不会被调用（--show-stats 里
+          #   Cacheable calls = 0），跨 run 缓存自然也就没意义。
+          #
+          #   只挂**编译器**（clang / cc / gcc），不挂 llvm-objcopy、llvm-ar 那些：
+          #   非编译调用对 ccache 只是多一次 exec 转发，收益为零，而 DTB 链进 vmlinux
+          #   那步正是靠 llvm-objcopy —— 万一转发出岔子，就是「刷上去卡第一 logo」
+          #   那个已经治好的病，没必要冒险。
+          # ------------------------------------------------------------------
+          sudo mkdir -p /usr/lib/ccache
+          for t in clang clang++ cc gcc g++; do
+            sudo ln -sf /usr/bin/ccache "/usr/lib/ccache/${t}"
+          done
+          # ccache 自己要在 PATH 里找「真实编译器」时跳过 /usr/lib/ccache，
+          # 显式告诉它真实工具在 /usr/bin（那里有指向 clang-18 的软链）。
+          #
+          # ⚠ 两个文件别混：$GITHUB_ENV 只认 KEY=VALUE，$GITHUB_PATH 才收裸目录。
+          #   2026-09-20 实际踩过 —— 把 "/usr/lib/ccache" 也塞进 $GITHUB_ENV，
+          #   runner 当场报
+          #       Error: Unable to process file command 'env' successfully.
+          #       Error: Invalid format '/usr/lib/ccache'
+          #   并让本步骤失败 → kernel job 整体挂掉 → 没产出 artifact →
+          #   下游 release 只会报一句看不懂的「out/ 是空的」。
+          {
+            echo "CCACHE_PATH=/usr/bin"
+            echo "CCACHE_DIR=${HOME}/.ccache"
+          } >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
       # ------------------------------------------------------------------
       # 打包工具必须用 AOSP 官方 mkbootimg（= Ubuntu 的 mkbootimg 包）
@@ -667,8 +797,57 @@ jobs:
           print('OK: 打包工具可产出规范 v4 头')
           PY
 
-      # ---- 复用历史 run 的 boot.img（省 20~30 分钟）----
-      - name: "[reuse] 复用历史 run 的 boot.img"
+      # ------------------------------------------------------------------
+      # ccache 跨 run 复用。
+      #
+      #   上游几乎每天都动，但**本工程自己的改动**（config 覆盖、USB gadget、版本串、
+      #   initramfs 宏…）往往只碰几个文件；有 ccache 时这类改动能命中绝大部分对象，
+      #   30 分钟的编译掉到几分钟。
+      #
+      #   key 里带 run_id：保证本次 run 结束时能存下一个新条目。cache 的行为是
+      #   「key 已存在就静默跳过保存」，key 固定的话第二次重跑就再也存不进去了。
+      #   上游每天都换 commit，key 基本不可能完全命中 —— 靠 restore-keys 前缀
+      #   去捞最近的那份旧缓存，这正是 ccache 想要的用法。
+      # ------------------------------------------------------------------
+      - name: "[cache] 恢复 ccache（跨 run 复用编译产物）"
+        id: ccache
+        if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-clang${{ needs.meta.outputs.clang_version }}-${{ needs.meta.outputs.kernel_commit || 'head' }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-clang${{ needs.meta.outputs.clang_version }}-${{ needs.meta.outputs.kernel_commit || 'head' }}-
+            ccache-clang${{ needs.meta.outputs.clang_version }}-
+
+      - name: "[cache] 校验 ccache 已生效"
+        if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
+        run: |
+          set -e
+          CC_PATH="$(command -v clang || true)"
+          echo "PATH 里的 clang : $CC_PATH"
+          echo "恢复到的缓存 key: ${{ steps.ccache.outputs.cache-matched-key }}"
+          if [ -z "${{ steps.ccache.outputs.cache-matched-key }}" ]; then
+            echo "本次没有可用缓存（首次构建，或旧缓存被淘汰）—— 编完会存一份，下次就快了"
+          fi
+          case "$CC_PATH" in
+            */ccache/*) echo "OK: clang 走 ccache" ;;
+            *)
+              echo "::error::clang 没走 ccache（期望 /usr/lib/ccache/clang）。"
+              echo "::error::上面「安装依赖」里建的软链目录没进 PATH，编译缓存不会起作用。"
+              exit 1
+              ;;
+          esac
+          ccache -z   # 清零统计，让编译后看到的命中率就是本次 run 的
+          ccache -s | head -12
+
+      # ---- 复用历史 run 的内核产物（省 20~30 分钟内核编译）----
+      #
+      #   复用的是「打包输入」（Image + initramfs[+ modules]），**不是**打好的 boot.img。
+      #   boot.img 照样在本次 run 里重新打包 —— 这样打包参数/打包工具的改动才会生效，
+      #   而且复用来的 Image 还能补跑「内嵌 .config 断言」这一关。
+      #   下面这些产物名都是当前工作流的命名（带时间戳），所以按 glob 收。
+      - name: "[reuse] 复用历史 run 的内核产物（Image / initramfs）"
         if: ${{ needs.meta.outputs.reuse_boot_from_run != '' }}
         uses: actions/download-artifact@v4
         with:
@@ -678,81 +857,264 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           if-no-files-found: error
 
-      - name: "[reuse] 校验复用的产物"
+      - name: "[reuse] 复用历史 run 的内核模块"
+        # 模块和内核必须来自同一次构建，否则 /lib/modules/<版本串> 对不上。
+        # 这里下了、后面「上传内核模块」再传一遍，是为了让 release / rootfs 两个
+        # job 在本 run 内也能拿到（它们只认本 run 的 artifact）。
+        if: ${{ needs.meta.outputs.reuse_boot_from_run != '' && needs.meta.outputs.build_modules == '1' }}
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: kernel-modules
+          path: .
+          run-id: ${{ needs.meta.outputs.reuse_boot_from_run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          if-no-files-found: warn
+
+      - name: "[reuse] 还原内核产物到编译目录"
         if: ${{ needs.meta.outputs.reuse_boot_from_run != '' }}
         run: |
           set -e
+          RID="${{ needs.meta.outputs.reuse_boot_from_run }}"
+          echo "=== run $RID 的 kernel-output 里拿到的东西 ==="
           ls -lh out
-          BOOT=$(ls out/boot-*.img 2>/dev/null | head -1 || true)
-          [ -n "$BOOT" ] || { echo "::error::复用的 run 里没有 boot-*.img"; exit 1; }
-          echo "复用产物: $BOOT"
-          # 严格校验：复用的历史产物也必须是规范 v4 头，不合格就直接失败，
-          # 别把一个刷不进去的 boot.img 一路带到 Release。
-          python3 .github/bot.py verify-bootimg "$BOOT"
+
+          mkdir -p linux/arch/arm64/boot initramfs
+
+          # ---- 1. 内核 Image：优先用未压缩的原件，只有 .gz 就解出来 ----
+          IMG_SRC="$(ls out/Image-* 2>/dev/null | grep -v '\.gz$' | head -1 || true)"
+          IMG_GZ="$(ls out/Image-*.gz 2>/dev/null | head -1 || true)"
+          if [ -n "$IMG_SRC" ]; then
+            cp "$IMG_SRC" linux/arch/arm64/boot/Image
+            echo "Image 来源 : $IMG_SRC"
+          elif [ -n "$IMG_GZ" ]; then
+            gunzip -c "$IMG_GZ" > linux/arch/arm64/boot/Image
+            echo "Image 来源 : $IMG_GZ（已解压）"
+          else
+            echo "::error::run $RID 的产物里没有 Image-*，没法复用「打包输入」"
+            echo "::error::本模式要的是内核 Image + initramfs，不是打好的 boot.img。"
+            echo "::error::请填一个由当前工作流构建的 run（它的 kernel-output 里带 Image-* / initramfs-*），"
+            echo "::error::或者留空 REUSE_BOOT_FROM_RUN 让它重新编译。"
+            ls -laR out | head -40 || true
+            exit 1
+          fi
+
+          # ---- 2. initramfs：mkbootimg 真正吃的是 .cpio.lz4 ----
+          IR_SRC="$(ls out/initramfs-*.cpio.lz4 2>/dev/null | head -1 || true)"
+          [ -n "$IR_SRC" ] || {
+            echo "::error::run $RID 的产物里没有 initramfs-*.cpio.lz4（打包 boot.img 需要它）"; exit 1; }
+          cp "$IR_SRC" initramfs/initramfs.cpio.lz4
+          IR_RAW="$(ls out/initramfs-*.cpio 2>/dev/null | head -1 || true)"
+          [ -n "$IR_RAW" ] && cp "$IR_RAW" initramfs/initramfs.cpio || true
+
+          echo "复用内核 Image : $(numfmt --to=iec "$(stat -c%s linux/arch/arm64/boot/Image)")"
+          echo "复用 initramfs : $IR_SRC -> $(numfmt --to=iec "$(stat -c%s initramfs/initramfs.cpio.lz4)")"
+
+          # reuse 模式没有源码树，版本串只能从镜像里抠（正常模式由「校验内核版本串」一步管）
+          python3 -c "d=open('linux/arch/arm64/boot/Image','rb').read(); i=d.find(b'Linux version '); print('    Image 版本串:', d[i:i+96].split(b'\n')[0].decode('utf-8','replace') if i>=0 else '(未找到 Linux version 串)')"
+
+          # ---- 3. 清掉历史产物里「本次会重新生成」的那几份 ----
+          #   boot-*.img                 ：本次重新打包，留着 Release 里会出现两个 boot.img，分不清谁是谁
+          #   boot-*.img.gz              ：历史遗留（现已不再生成），一并清掉免得混进来
+          #   Image-* / initramfs-*      ：已拷进编译目录，打包步骤会按本次 STAMP 重新落盘
+          #   SHA256SUMS-*.txt           ：上面几个文件都换了，旧校验和会指向不存在的文件
+          # 留 out/kernel-*.config 不动 —— 它就是这次复用的那个内核的 config，有核对价值。
+          rm -f out/boot-*.img out/boot-*.img.gz out/SHA256SUMS-*.txt out/Image-* out/initramfs-*
+          echo "=== 清理后 ==="
+          ls -lh out
+          echo "OK: 内核产物已就位，接下来只重打 boot.img（不编译内核）"
 
       - name: "[boot] 拉取内核源码"
         if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
+        env:
+          KC: ${{ needs.meta.outputs.kernel_commit }}
         run: |
           set -e
-          for i in 1 2 3; do
-            git clone -b "${{ needs.meta.outputs.kernel_branch }}" --depth 1 \
-              "$KERNEL_REPO_URL" linux && break
-            echo "第 $i 次失败，重试…"; rm -rf linux; sleep 15
-          done
-          test -d linux || { echo "::error::内核源码拉取失败"; exit 1; }
-          cd linux
-          if [ -n "${{ needs.meta.outputs.kernel_commit }}" ]; then
-            git fetch --depth=1 origin "${{ needs.meta.outputs.kernel_commit }}" || true
-            git checkout -q "${{ needs.meta.outputs.kernel_commit }}"
+          # ⚠ GitHub 的 uploadpack.allowAnySHA1InWant 默认是**关**的 —— 只有被某个 ref
+          #   直接指向的 sha 才能 fetch。给「历史中间的 commit」跑
+          #     git fetch --depth=1 origin <sha>
+          #   一定报 `fatal: couldn't find remote ref <sha>`，紧跟一句
+          #   `pathspec did not match any file(s)`（2026-09-21 实踩：37812e8ab655）。
+          #   所以指定了 commit 时改用 **archive API**：任意 commit 都能拿到整棵树快照。
+          #   代价是没有 .git —— 后续步骤不依赖它（本工程要的只是源码树 + 一个 sha 字符串）。
+          if [ -n "$KC" ]; then
+            echo "内核固定到 commit: $KC（走 archive API）"
+            for i in 1 2 3; do
+              curl -fsSL "$KERNEL_REPO_URL/archive/$KC.tar.gz" -o /tmp/kernel.tgz && break
+              echo "第 $i 次下载失败，重试…"; rm -f /tmp/kernel.tgz; sleep 15
+            done
+            test -s /tmp/kernel.tgz || { echo "::error::内核 archive 下载失败: $KC"; exit 1; }
+            mkdir -p linux
+            tar -xzf /tmp/kernel.tgz -C linux --strip-components=1
+            rm -f /tmp/kernel.tgz
+            test -f linux/arch/arm64/configs/defconfig || { echo "::error::archive 解出来不像内核源码树"; exit 1; }
+            {
+              echo "KERNEL_COMMIT=$KC"
+              echo "KERNEL_COMMIT_SHORT=${KC:0:12}"
+            } >> "$GITHUB_ENV"
+            echo "内核已固定到 $KC（archive 快照，无 .git）"
+          else
+            for i in 1 2 3; do
+              git clone -b "${{ needs.meta.outputs.kernel_branch }}" --depth 1 \
+                "$KERNEL_REPO_URL" linux && break
+              echo "第 $i 次失败，重试…"; rm -rf linux; sleep 15
+            done
+            test -d linux/.git || { echo "::error::内核源码拉取失败"; exit 1; }
+            cd linux
+            {
+              echo "KERNEL_COMMIT=$(git rev-parse HEAD)"
+              echo "KERNEL_COMMIT_SHORT=$(git rev-parse --short HEAD)"
+            } >> "$GITHUB_ENV"
+            git log -1 --format='%H %s'
           fi
-          {
-            echo "KERNEL_COMMIT=$(git rev-parse HEAD)"
-            echo "KERNEL_COMMIT_SHORT=$(git rev-parse --short HEAD)"
-          } >> "$GITHUB_ENV"
-          git log -1 --format='%H %s'
 
       - name: "[boot] 拉取 initramfs 源码"
         if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
+        env:
+          IC: ${{ needs.meta.outputs.initramfs_commit }}
         run: |
           set -e
-          for i in 1 2 3; do
-            git clone --depth 1 -b "$INITRAMFS_BRANCH" "$INITRAMFS_REPO_URL" initramfs && break
-            echo "第 $i 次失败，重试…"; rm -rf initramfs; sleep 15
-          done
-          test -d initramfs || { echo "::error::initramfs 拉取失败"; exit 1; }
-          cd initramfs
-          if [ -n "${{ needs.meta.outputs.initramfs_commit }}" ]; then
-            git fetch --depth=1 origin "${{ needs.meta.outputs.initramfs_commit }}" || true
-            git checkout -q "${{ needs.meta.outputs.initramfs_commit }}"
+          # 同「拉取内核源码」那个坑：GitHub 不允许 fetch 任意历史 sha
+          # （`couldn't find remote ref`），指定 commit 时一律走 archive API。
+          if [ -n "$IC" ]; then
+            echo "initramfs 固定到 commit: $IC（走 archive API）"
+            for i in 1 2 3; do
+              curl -fsSL "$INITRAMFS_REPO_URL/archive/$IC.tar.gz" -o /tmp/initramfs.tgz && break
+              echo "第 $i 次下载失败，重试…"; rm -f /tmp/initramfs.tgz; sleep 15
+            done
+            test -s /tmp/initramfs.tgz || { echo "::error::initramfs archive 下载失败: $IC"; exit 1; }
+            mkdir -p initramfs
+            tar -xzf /tmp/initramfs.tgz -C initramfs --strip-components=1
+            rm -f /tmp/initramfs.tgz
+            test -f initramfs/Makefile || { echo "::error::archive 解出来不像 initramfs 源码树"; exit 1; }
+            {
+              echo "INITRAMFS_COMMIT=$IC"
+              echo "INITRAMFS_COMMIT_SHORT=${IC:0:12}"
+            } >> "$GITHUB_ENV"
+            echo "initramfs 已固定到 $IC（archive 快照，无 .git）"
+          else
+            for i in 1 2 3; do
+              git clone --depth 1 -b "$INITRAMFS_BRANCH" "$INITRAMFS_REPO_URL" initramfs && break
+              echo "第 $i 次失败，重试…"; rm -rf initramfs; sleep 15
+            done
+            test -d initramfs/.git || { echo "::error::initramfs 拉取失败"; exit 1; }
+            cd initramfs
+            {
+              echo "INITRAMFS_COMMIT=$(git rev-parse HEAD)"
+              echo "INITRAMFS_COMMIT_SHORT=$(git rev-parse --short HEAD)"
+            } >> "$GITHUB_ENV"
+            git log -1 --format='%H %s'
           fi
-          {
-            echo "INITRAMFS_COMMIT=$(git rev-parse HEAD)"
-            echo "INITRAMFS_COMMIT_SHORT=$(git rev-parse --short HEAD)"
-          } >> "$GITHUB_ENV"
-          git log -1 --format='%H %s'
 
-      - name: "[boot] 合并内核配置（defconfig + xaga.config[ + USB gadget 片段]）"
+      - name: "[boot] 合并内核配置（defconfig + xaga.config + 内联修正）"
         if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
         working-directory: linux
         env:
           USB_GADGET: ${{ needs.meta.outputs.usb_gadget }}
+          MTK_VCP_SCP_AS_MODULE: ${{ needs.meta.outputs.vcp_scp_as_module }}
         run: |
           set -e
           test -f arch/arm64/configs/defconfig   || { echo "::error::缺 defconfig"; exit 1; }
           test -f arch/arm64/configs/xaga.config || { echo "::error::缺 xaga.config（分支选错了？）"; exit 1; }
 
           MERGE=(arch/arm64/configs/defconfig arch/arm64/configs/xaga.config)
+          ARCH=arm64 scripts/kconfig/merge_config.sh -m "${MERGE[@]}"
 
-          # USB gadget 片段放最后：merge_config.sh 后写覆盖先写，
-          # 这样不用去 fork 内核仓库改 xaga.config
-          FRAG="$GITHUB_WORKSPACE/usb-debug/kernel-fragments/xaga-usb-gadget.config"
+          # ---- USB gadget：直接写进 .config，不再依赖 usb-debug/kernel-fragments/ ----
+          #
+          # 上游 defconfig 里 gadget 相关全是 =m，xaga.config 只把 CONFIG_USB_GADGET
+          # 置了 y；而本流程只 `make Image`（不编模块、不装 /lib/modules），
+          # 所以**所有 =m 等于没编** —— 插上 PC 后内核里既没有 configfs-gadget，
+          # 也没有任何 gadget function，PC 侧什么都看不到（「USB 连不上」的根因）。
+          # 这里逐个 --enable 强制内建，一个模块都不依赖；效果与原先的
+          # kernel-fragments/xaga-usb-gadget.config 完全一致，但少一个文件依赖。
           if [ "$USB_GADGET" = "1" ]; then
-            test -f "$FRAG" || { echo "::error::找不到 $FRAG"; exit 1; }
-            MERGE+=("$FRAG")
-            echo "已追加 gadget 片段: $FRAG"
+            ./scripts/config \
+              --enable CONFIG_USB_GADGET \
+              --enable CONFIG_USB_LIBCOMPOSITE \
+              --enable CONFIG_USB_CONFIGFS \
+              --enable CONFIG_USB_U_SERIAL \
+              --enable CONFIG_USB_U_ETHER \
+              --enable CONFIG_USB_F_ACM \
+              --enable CONFIG_USB_F_SERIAL \
+              --enable CONFIG_USB_F_OBEX \
+              --enable CONFIG_USB_F_NCM \
+              --enable CONFIG_USB_F_ECM \
+              --enable CONFIG_USB_F_EEM \
+              --enable CONFIG_USB_F_RNDIS \
+              --enable CONFIG_USB_F_SUBSET \
+              --enable CONFIG_USB_F_MASS_STORAGE \
+              --enable CONFIG_USB_F_FS \
+              --enable CONFIG_USB_CONFIGFS_ACM \
+              --enable CONFIG_USB_CONFIGFS_SERIAL \
+              --enable CONFIG_USB_CONFIGFS_NCM \
+              --enable CONFIG_USB_CONFIGFS_ECM \
+              --enable CONFIG_USB_CONFIGFS_RNDIS \
+              --enable CONFIG_USB_CONFIGFS_EEM \
+              --enable CONFIG_USB_CONFIGFS_MASS_STORAGE \
+              --enable CONFIG_USB_CONFIGFS_F_FS \
+              --enable CONFIG_USB_ACM \
+              --enable CONFIG_USB_SERIAL \
+              --enable CONFIG_USB_SERIAL_GENERIC \
+              --enable CONFIG_USB_SERIAL_CH341 \
+              --enable CONFIG_USB_SERIAL_CP210X \
+              --enable CONFIG_USB_SERIAL_FTDI_SIO \
+              --enable CONFIG_USB_SERIAL_PL2303
+            # legacy g_serial 一旦内建就会在 probe 时抢占 UDC（一个 UDC 只能绑一个
+            # gadget driver），configfs 就再也绑不上，保持上游的关闭决定。
+            ./scripts/config --disable CONFIG_USB_G_SERIAL
           fi
 
-          ARCH=arm64 scripts/kconfig/merge_config.sh -m "${MERGE[@]}"
+          # ---- 9-20 启动回归的规避：VCP / SCP 改回模块 ----
+          #
+          # 上游 PR14+PR15（b311b740b323 / e9eacef6064a）把这三个从「=m / 无」一次性改成 =y：
+          #   CONFIG_MTK_VCP_RPROC（新增）、CONFIG_MTK_SCP、CONFIG_RPMSG_MTK_SCP
+          # 并给 DTB 加了 vcp@1ea00000 节点。上游在 xaga.config 里的注释是
+          # "the target boots from the embedded initramfs" —— 为「内建 initramfs」设计的；
+          # 本工程走外部 ramdisk、initramfs 阶段 rootfs 还挂在 /dev/sdc86 上没起来，
+          # 这批早期内建的驱动就是「卡第一 logo」的成因 #4（README §8.4.1）。
+          #
+          # 三个符号在 drivers/remoteproc/Kconfig 里都是 **tristate**，所以能安全改回 =m。
+          # 这比「把 KERNEL_COMMIT 钉回 37812e8ab655」更好：PR15 对 SCP 崩溃的修复
+          # （cb1a1483f15d）改的是驱动源码，模块形态照样生效；钉老 commit 会把它一起丢掉，
+          # SCP 又变回每 ~3 分钟崩一次。改成模块后 probe 推迟到 switch_root 之后，
+          # 那时 /lib/firmware 已经可用，固件也能正常取到。
+          #
+          # ⚠ CONFIG_MTK_DVFSRC / CONFIG_REGULATOR_MTK_DVFSRC **不在这里动**：上游已删掉
+          #   旧的 MTK6895_DVFSRC_PIN 驱动源码、DTB 也换成了 mediatek,mt6895-dvfsrc 节点，
+          #   关掉等于 CPU vcore 没人管。
+          if [ "$MTK_VCP_SCP_AS_MODULE" = "1" ]; then
+            ./scripts/config \
+              --module CONFIG_MTK_VCP_RPROC \
+              --module CONFIG_MTK_SCP \
+              --module CONFIG_RPMSG_MTK_SCP
+            echo "已把 VCP / SCP 改回模块（规避 9-20 启动回归，README §8.4.1）"
+          else
+            echo "VCP / SCP 保持上游的 =y（与上游提交一一对应）"
+          fi
+
+          # ---- "[connlog] ... cache is full." 无限刷屏：**这里刻意什么都不做** ----
+          #
+          # 要不要在编译期根治？不行，除非动上游源码，而本工作流有一条硬规矩：
+          #   **产物必须与上游 commit 一一对应**（Same commit in → same image out），
+          #   所以 runner 上的源码树一个字节都不改。
+          #
+          # 为什么"只改 .config"做不到（上游把开关硬编码进构建脚本，与 .config 无关）：
+          #   1) drivers/misc/mediatek/connectivity/Makefile
+          #        export CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH := y
+          #   2) drivers/misc/mediatek/connectivity/conninfra/Kbuild
+          #        ccflags-y += -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH   ← 无条件
+          #   第 2) 条把宏直接塞给编译器，源码里 `#ifdef CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH`
+          #   恒为真 —— 哪怕 .config 写成 `# ... is not set`，connsyslog 那一套照样编进内核。
+          #   想让它生效必须 sed 掉那两行，那就是改源码，不做。
+          #
+          # 所以解法整个放到**用户态**（rootfs 侧）：connlog 说到底是"本该有人来读、
+          # 但没人读"——安卓由 MTK 的 connsys_log daemon 读，我们的 rootfs 没有。
+          # 现在由 rootfs job 装一个常驻的 xaga-connlog-drain 把 /dev/fw_log_* 读走，
+          # 缓存不积压，pr_warn 自然不再触发。零源码侵入，且设备侧
+          # `systemctl stop xaga-connlog-drain` 就能随时把那条警告请回来看。
+          # （实测基线：一份 1.5 小时日志里 `cache is full` 1110 条、`[connlog]` 1694 条。）
+          echo "connlog 刷屏按「不改源码」处理：编译期不做任何手脚，交给 rootfs 侧排水服务"
 
           # 首次构建关 Rust（需要 rustc>=1.85 / bindgen>=0.71）
           ./scripts/config --disable CONFIG_RUST
@@ -760,6 +1122,44 @@ jobs:
           ./scripts/config --set-str CONFIG_DRM_PANIC_SCREEN "kmsg"
           # 新版 clang 会把驱动警告升级成错误
           ./scripts/config --disable CONFIG_WERROR
+
+          # ---- 外部 initramfs 兼容（2026-09-20 刷机实测踩过，卡第一 logo 反复重启）----
+          #
+          # 上游 xaga.config 从 e9eacef6 起改成了「initramfs 内建进内核」的方案，
+          # 见 arch/arm64/configs/xaga.config 末尾那段注释：
+          #     "the target boots from the embedded initramfs"
+          #     CONFIG_CMDLINE_FORCE=y / CONFIG_INITRAMFS_FORCE=y
+          # 而本构建走的是**外部 ramdisk**：kernel job 单独编 initramfs，再交给
+          # mkbootimg 的 --ramdisk 打进 boot.img。两者直接冲突：
+          #
+          #   CONFIG_INITRAMFS_FORCE 的语义就是 "Ignore the initramfs passed by the
+          #   bootloader" —— 内核会**完全无视 boot.img 的 ramdisk 段**；而
+          #   CONFIG_INITRAMFS_SOURCE 是空串，内核里又没有内建 initramfs。
+          #   → 内核拿不到任何 init，挂不了 rootfs，panic；
+          #     上游又设了 panic=0（不自动重启），MTK 侧看门狗复位，
+          #     表现就是画面停在第一 logo 然后不断重启。
+          #
+          # 所以这里强制关掉 FORCE，回到「ramdisk 由 bootloader 传入」的形态。
+          # 先把两个前置显式钉成空串，再关 FORCE —— 见下面断言处的注释：
+          #   INITRAMFS_SOURCE=""  → INITRAMFS_FORCE 不可见（kconfig 不写它，双保险）
+          #   CMDLINE=""           → cmdline type 那个 choice 整体不可见
+          # 这两条本来就是 defconfig 的默认值，显式写出来是为了**不依赖上游默认值**：
+          # 万一哪天上游 xaga.config 给 INITRAMFS_SOURCE 填了路径（它真的在内建 initramfs
+          # 方案和外挂 ramdisk 方案之间改过一次，见 e9eacef6），本构建仍然走外部 ramdisk。
+          ./scripts/config --set-str CONFIG_INITRAMFS_SOURCE ""
+          ./scripts/config --set-str CONFIG_CMDLINE ""
+          ./scripts/config --disable CONFIG_INITRAMFS_FORCE
+
+          # 同理：CMDLINE_FORCE=y 会让内核丢弃内嵌 DTB 的 /chosen/bootargs
+          # （xaga 生效的 cmdline 就来自那里，含补丁加的 panic=15）。
+          # 恢复成「有 bootargs 就用 bootargs，没有才退回 CONFIG_CMDLINE」——
+          # 这正是本工程此前实机验证能启动的那套组合。
+          ./scripts/config --disable CONFIG_CMDLINE_FORCE
+          # 注：这条 --enable 在 CMDLINE="" 时**不会真的写进 .config**（该 choice 整体
+          # `depends on CMDLINE != ""`，不可见）。留着它是无害的兜底：一旦哪天有人填了
+          # CONFIG_CMDLINE，内核就该优先用 bootloader 的 bootargs 而不是覆盖它。
+          # 别去断言它 =y —— 在本构建的形态下它整行不存在，断言必然误报。
+          ./scripts/config --enable  CONFIG_CMDLINE_FROM_BOOTLOADER
 
           # 关掉与 xaga(MT6895) 无关的联发科 ASoC 驱动：
           # mt8183-afe-pcm.c 的 MTK_AFE_RATE_8K 与 common/mtk-base-afe.h 同名枚举取值不同，
@@ -817,8 +1217,41 @@ jobs:
             echo "::error::CONFIG_LOCALVERSION_AUTO 没关掉（尾巴会变成 -g<sha>）"; exit 1; }
           echo "内核版本串将生成: $(make -s ARCH=arm64 kernelversion)${KERNEL_LOCALVERSION}"
 
+          # initramfs / cmdline 形态断言：这两条只要有一条不对，镜像必然卡在第一 logo 反复重启
+          # （成因见上面「外部 initramfs 兼容」那段注释，2026-09-20 实测踩过）
+          #
+          # ⚠ 断言必须写成「**禁止 =y/=m，允许整行 absent**」（2026-09-20 修，之前误伤过一次）。
+          #   这两个符号都**不是无条件可见**的，所以 olddefconfig 后可能整行不出现：
+          #     - CONFIG_INITRAMFS_FORCE  依赖 INITRAMFS_SOURCE 非空才可见；
+          #     - CONFIG_CMDLINE_FORCE    属于「Kernel command line type」这个 choice，
+          #                               而该 choice 整体 `depends on CMDLINE != ""`。
+          #   本构建恰好把这两个前置都置空（走外部 ramdisk + DTB bootargs），于是它们
+          #   不可见 → kconfig **根本不往 .config 里写这一行**（既不是 `=n`，也不是
+          #   `# CONFIG_X is not set`）。
+          #   证据：实测可启动的基线 usb-debug/reference/boot-img-007893e66767.config
+          #   里这两个符号就是整行不存在的（同段还能看到 INITRAMFS_SOURCE="" 与 CMDLINE=""）。
+          #
+          #   所以早先写成 `grep -qx '# CONFIG_INITRAMFS_FORCE is not set'` 会把
+          #   **本来是对的**内核判死：assert 失败 → kernel job 挂 → 不上传 artifact →
+          #   release 才报那句看不懂的「out/ 是空的」。
+          #   （同理别去断言 `CONFIG_CMDLINE_FROM_BOOTLOADER=y` —— 它同样在这个 choice 里，
+          #    不可见时也整行不存在，断言它必然误报。）
+          if grep -qE '^CONFIG_INITRAMFS_FORCE=(y|m)$' .config; then
+            echo "::error::CONFIG_INITRAMFS_FORCE 还是开着 —— 内核会无视 boot.img 的 ramdisk，而镜像里又没有内建 initramfs，刷上去就是卡第一 logo 重启"
+            exit 1
+          fi
+          if grep -qE '^CONFIG_CMDLINE_FORCE=(y|m)$' .config; then
+            echo "::error::CONFIG_CMDLINE_FORCE 还是开着 —— 内嵌 DTB 的 /chosen/bootargs（含补丁加的 panic=15）会被丢弃"
+            exit 1
+          fi
+          # 把实际状态打出来，日后 diff 方便（absent / is not set 都是安全的，=y 才是病）
+          echo "initramfs / cmdline 形态断言通过（外部 ramdisk + DTB bootargs 优先）"
+          grep -E '^(# )?CONFIG_(INITRAMFS_FORCE|CMDLINE_FORCE|INITRAMFS_SOURCE|CMDLINE)=' .config \
+            || echo "  （INITRAMFS_FORCE / CMDLINE_FORCE 整行不存在 = 符号不可见 = 未启用，符合预期）"
+
           echo "=== 关键配置 ==="
           grep -E '^CONFIG_(OF|BLK_DEV_INITRD|RD_LZ4|CONFIGFS_FS|MODULES|IKCONFIG|LZ4)=' .config || true
+          grep -E '^(# )?CONFIG_(INITRAMFS|CMDLINE)' .config || true
 
           if [ "$USB_GADGET" = "1" ]; then
             # 硬断言：宁可构建失败，也不要再产出一个「插上 PC 没反应」的 boot.img
@@ -883,7 +1316,7 @@ jobs:
           STAMP="$(date -u +%Y%m%d-%H%M%S)"
           echo "STAMP=$STAMP" >> "$GITHUB_ENV"
           echo "本次产物时间戳: $STAMP"
-          echo "产物命名: boot-${STAMP}.img / boot-${STAMP}.img.gz / Image-${STAMP}.gz / initramfs-${STAMP}.cpio.lz4 / modules-${STAMP}.tar.gz"
+          echo "产物命名: boot-${STAMP}.img / Image-${STAMP}[.gz] / initramfs-${STAMP}.cpio.lz4 / modules-${STAMP}.tar.gz"
 
       - name: "[boot] 编译内核模块（-k 容忍个别驱动编不过）"
         if: ${{ needs.meta.outputs.reuse_boot_from_run == '' && needs.meta.outputs.build_modules == '1' }}
@@ -908,6 +1341,55 @@ jobs:
           echo "KVER_DIR=$(ls lib/modules | head -1)" >> "$GITHUB_ENV"
           du -h "$GITHUB_WORKSPACE/modules-${STAMP}.tar.gz"
           find lib/modules -name '*.ko*' | wc -l
+
+      # 编译全部结束后统计一次：命中率高说明本次改动很小（只动 config / 几个文件），
+      # 命中率低也不奇怪 —— 上游 merge 了大量东西时本来就要重编。
+      #
+      # 解析特意写得宽松：ccache 各版本的统计键名不完全一样（cache_hit_direct /
+      # direct_cache_hit ...），所以按「键名里带 hit / miss」来求和，并排除 rate 之类的
+      # 比率字段。原始 --print-stats 也原样打一遍，真有版本差异时照着日志就能看出来。
+      - name: "[cache] ccache 命中率"
+        if: ${{ always() && needs.meta.outputs.reuse_boot_from_run == '' }}
+        run: |
+          set -e
+          echo "=== ccache --show-stats ==="
+          ccache --show-stats || true
+
+          S="$(ccache --print-stats 2>/dev/null || true)"
+          if [ -z "$S" ]; then
+            echo "::notice::这个 ccache 版本没有 --print-stats，跳过命中率统计（看上面的 -s 输出即可）"
+            exit 0
+          fi
+          echo "=== ccache --print-stats ==="
+          echo "$S"
+
+          if [ "$(echo "$S" | awk -F'\t' '$1 ~ /hit|miss/ {n++} END {print n+0}')" -eq 0 ]; then
+            echo "::notice::--print-stats 里没有 hit/miss 字段（ccache 版本差异），跳过命中率判定"
+            exit 0
+          fi
+
+          HIT="$(echo "$S"  | awk -F'\t' '$1 ~ /hit/  && $1 !~ /rate|ratio|percent/ {s += $2+0} END {print s+0}')"
+          MISS="$(echo "$S" | awk -F'\t' '$1 ~ /miss/ && $1 !~ /rate|ratio|percent/ {s += $2+0} END {print s+0}')"
+          TOT=$(( HIT + MISS ))
+          echo "命中 $HIT / 未命中 $MISS（合计 $TOT 次可缓存调用）"
+          if [ "$TOT" -eq 0 ]; then
+            echo "::warning::ccache 统计是可缓存调用 0 次 —— 这次编译等于没走缓存。"
+            echo "::warning::检查上面「校验 ccache 已生效」那步，以及 PATH 里 /usr/lib/ccache 是否还在最前面。"
+          else
+            echo "ccache 命中率: $(( HIT * 100 / TOT ))%"
+          fi
+
+      - name: "[cache] 保存 ccache（供下次构建复用）"
+        # 用 restore/save 两个独立 action 而不是合并版 actions/cache：
+        # 合并版的后置保存只在 job **成功**时才写；而这个工程经常在 config 断言
+        # 那一步故意失败（就是设计成失败得快），此时前面几十万个对象已经编好了，
+        # 全部丢掉太亏。always() 让失败路径也能把缓存存下来。
+        # （key 已存在时 cache 会静默跳过保存，不影响构建。）
+        if: ${{ always() && needs.meta.outputs.reuse_boot_from_run == '' && steps.ccache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
 
       - name: "[boot] 编译 initramfs（把 BOOT/NVDATA 分区宏注进去）"
         if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
@@ -934,8 +1416,11 @@ jobs:
           echo "=== 确认分区宏已注入 ==="
           strings root/init | grep -E '^/dev/' | sort -u || true
 
+      # 注意：这一步**在 reuse 模式也要跑**，所以故意不加 if。
+      #   —— 复用的是 Image + initramfs（打包输入），boot.img 每次重打：
+      #      打包参数改了能生效，写进 boot.img 的东西（ramdisk 段、header）也始终是本次的。
+      #      输入由上面的「[reuse] 还原内核产物到编译目录」铺好，路径与正常编译时完全一致。
       - name: "[boot] 打包 boot.img（参数对齐 postmarketOS wiki）"
-        if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
         env:
           MEM_LIMIT: ${{ needs.meta.outputs.mem_limit }}
         run: |
@@ -979,34 +1464,71 @@ jobs:
           # 头部规范性（v4 → header_version=4 + header_size=1584）由下游
           # 「[boot] 校验 boot.img 头部」一步断言；打包器本身已在冒烟测试里验过。
 
-          # boot.img -> .gz：存档 / 发网盘 / release 下载都省流量；
-          # 刷机仍然用 .img 本体（fastboot 不认 .gz）。
-          gzip -n -9 -c "$BOOT_IMG" > "${BOOT_IMG}.gz"
-          gzip -t "${BOOT_IMG}.gz"     # 回读校验，防止写出坏包
-          echo "$(numfmt --to=iec "$(stat -c%s "$BOOT_IMG")") -> $(numfmt --to=iec "$(stat -c%s "${BOOT_IMG}.gz")")"
-          ls -lh "${BOOT_IMG}.gz"
+          # boot.img **不再压缩**（2026-09-20 起）。
+          #   理由一：内部已经是 gzip 的 Image + LZ4 的 ramdisk，再压只省 2%
+          #           （20.5 MiB -> 20.1 MiB），收益几乎为零。
+          #   理由二（关键）：多一个 .gz 就多一次刷错的机会 —— fastboot 不校验内容，
+          #           把 gzip 数据写进 boot 分区后 LK 读不到 `ANDROID!` magic，
+          #           表现是**卡在第一 logo 反复重启**，而 fastboot 全程不报任何错。
+          #           2026-09-20 实际踩过一次（见 README §8.4）。
+          #   现在 boot 在 artifact / Release / 本地产物里都只有未压缩的 .img，
+          #   想刷错都没机会。
+          ls -lh "$BOOT_IMG"
+          echo "boot.img 保持未压缩（刷机直接用它）"
 
       - name: "[boot] 校验 boot.img 头部（v4 必须 header_size=1584）"
         run: |
           set -e
-          # 这一步在 reuse 模式下也必须跑（要校验复用的历史产物），所以不能加 if。
-          # 非 reuse 模式直接用打包步骤写进环境变量的 BOOT_IMG；
-          # reuse 模式没有 BOOT_IMG/STAMP，就从 out/ 里挑（artifact 里只会有一个）。
+          # 两种模式都必须跑：正常模式校验刚打出来的；reuse 模式校验**本次重打**的那只
+          # （打包步骤两种模式都执行，所以 out/ 里正常情况下只有一个 boot-*.img）。
           shopt -s nullglob
           IMGS=(out/boot-*.img)
           shopt -u nullglob
           [ ${#IMGS[@]} -gt 0 ] || { echo "::error::out/ 里没有 boot-*.img（打包步骤被跳过？产物没上传？）"; exit 1; }
+          [ ${#IMGS[@]} -le 1 ] || echo "::warning::out/ 里有多个 boot-*.img（${IMGS[*]}），下面只校验第一个"
           BOOT="${BOOT_IMG:-${IMGS[0]}}"
           echo "校验: $BOOT"
           python3 .github/bot.py verify-bootimg "$BOOT"
 
       - name: "[boot] 从产物本身复核内嵌 .config（IKCFG）"
-        if: ${{ needs.meta.outputs.reuse_boot_from_run == '' }}
+        # reuse 模式也跑：复用的历史 Image 同样要过这一关。
+        # 这一步是「卡第一 logo」那类事故的最后一道闸 —— 断言外部 ramdisk / DTB bootargs 形态，
+        # 不合格宁可构建失败，也不产出一个刷上去就重启的 boot.img。
         env:
           USB_GADGET: ${{ needs.meta.outputs.usb_gadget }}
+          VCP_SCP_MOD: ${{ needs.meta.outputs.vcp_scp_as_module }}
+          REUSED_RUN: ${{ needs.meta.outputs.reuse_boot_from_run }}
         run: |
           set -e
           IMG="out/Image-${STAMP}"
+          [ -f "$IMG" ] || { echo "::error::找不到 $IMG（打包步骤没跑？）"; exit 1; }
+
+          # ---- 自检：仓库里的 bot.py 必须是「含 --assert-n」的那版 ----
+          #
+          # 本机不是 git 仓库、推代码靠手动复制，最常出的事故就是**漏推某个文件**，
+          # 而这类缺失**不会报错**，只会让功能静默降级。2026-09-20 就真实发生过一次：
+          # 远端 .github/bot.py 停在旧版（29078 字节，没有 --assert-n），于是这一步
+          # argparse 吐出一句
+          #     bot.py: error: unrecognized arguments: --assert-n CONFIG_...
+          # 看着像「参数写错了」，实际是**文件没推上去**。排查方向完全跑偏。
+          # 所以在这里硬校验一次，把「漏推」直接翻译成一句能照做的指令。
+          if ! python3 .github/bot.py inspect-image --help 2>&1 | grep -q -- '--assert-n'; then
+            echo "::error::.github/bot.py 不支持 --assert-n —— 仓库里这份是旧版，推代码时漏推了它。"
+            echo "::error::当前大小: $(stat -c%s .github/bot.py 2>/dev/null || echo 未知) 字节；含 --assert-n 的那版约 31 KB。"
+            echo "::error::修法：把本仓库的 .github/bot.py 重新推到 GitHub 即可（其余文件不用动）。"
+            exit 1
+          fi
+
+          # 只断言「不能开的那两项」。不写成 --assert-y CONFIG_CMDLINE_FROM_BOOTLOADER：
+          # CONFIG_CMDLINE="" 时 arm64 的 *cmdline choice* 没有 prompt，kconfig 压根不写这一项
+          # （见已实测可启动的基线 usb-debug/reference/boot-img-007893e66767.config，
+          # 里面就没有 CONFIG_CMDLINE_FROM_BOOTLOADER），断言它 =y 会把好镜像判死。
+          # --assert-n 对「整行不存在」判通过，正好兼容这两种形态。
+          python3 .github/bot.py inspect-image "$IMG" \
+            --assert-n CONFIG_INITRAMFS_FORCE CONFIG_CMDLINE_FORCE \
+            --keys CONFIG_INITRAMFS_SOURCE CONFIG_CMDLINE \
+                   CONFIG_CMDLINE_FORCE CONFIG_CMDLINE_FROM_BOOTLOADER
+
           if [ "$USB_GADGET" = "1" ]; then
             python3 .github/bot.py inspect-image "$IMG" \
               --assert-y CONFIG_USB_GADGET CONFIG_USB_LIBCOMPOSITE CONFIG_USB_CONFIGFS \
@@ -1015,17 +1537,40 @@ jobs:
           else
             python3 .github/bot.py inspect-image "$IMG"
           fi
-          # 顺手把完整 config 落盘，方便回来 diff
-          python3 .github/bot.py inspect-image "$IMG" --dump "out/kernel-${STAMP}.config" || true
+
+          # ---- VCP / SCP 模块化是否真的生效（规避 9-20 启动回归的验收点）----
+          # 只禁止 `=y`：改成 =m 是要的效果，absent（老内核没有这些符号）也算通过。
+          # 复用历史 Image 时这里同样会拦 —— 复用的是旧内核，模块没改回 =m 就别发。
+          if [ "$VCP_SCP_MOD" = "1" ]; then
+            python3 .github/bot.py inspect-image "$IMG" --dump /tmp/ikcfg-$$.config >/dev/null
+            for k in CONFIG_MTK_VCP_RPROC CONFIG_MTK_SCP CONFIG_RPMSG_MTK_SCP; do
+              if grep -qE "^${k}=y$" "/tmp/ikcfg-$$.config"; then
+                echo "::error::$k 仍是 =y —— VCP/SCP 模块化没生效（scripts/config --module 失败了？）"
+                echo "::error::这样打出来的 boot.img 很可能又是「卡第一 logo」（README §8.4.1）"
+                rm -f "/tmp/ikcfg-$$.config"; exit 1
+              fi
+              v="$(grep -E "^${k}=(m|y)$" "/tmp/ikcfg-$$.config" || true)"
+              echo "  $k: ${v:-absent（OK）}"
+            done
+            rm -f "/tmp/ikcfg-$$.config"
+          fi
+          # 顺手把完整 config 落盘，方便回来 diff。
+          # reuse 模式跳过：out/ 里已经有那次构建留下的 kernel-*.config，内容一样，
+          # 再 dump 一份只会多一个同名不同戳的文件。
+          if [ -z "$REUSED_RUN" ]; then
+            python3 .github/bot.py inspect-image "$IMG" --dump "out/kernel-${STAMP}.config" || true
+          fi
 
       - name: "[boot] 生成校验和"
         run: |
           set -e
           cd out
-          # 用 glob 而不是拼 ${STAMP}：reuse 模式下产物名带的是历史 run 的戳，
-          # 拿本次的 STAMP 去拼文件名会直接 "No such file or directory"。
+          # 用 glob 而不是拼 ${STAMP}：万一 out/ 里混进了别的戳的文件，
+          # 拿本次 STAMP 去拼文件名会直接 "No such file or directory"。
           shopt -s nullglob
-          FILES=(boot-*.img boot-*.img.gz Image-*.gz initramfs-*.cpio.lz4)
+          # boot 不再生成 .gz；Image 的**未压缩件**也纳入清单（Release 要留永久存档，
+          # 想复用某次构建的内核时直接从 Release 下这个文件，不受 artifact 90 天过期影响）
+          FILES=(boot-*.img Image-* initramfs-*.cpio.lz4)
           shopt -u nullglob
           [ ${#FILES[@]} -gt 0 ] || { echo "::error::out/ 里没有 boot 产物"; exit 1; }
           sha256sum "${FILES[@]}" > "SHA256SUMS-${STAMP}.txt"
@@ -1035,21 +1580,26 @@ jobs:
         id: kout
         if: always()
         run: |
+          # 内核版本串（uname -a 里那段）。正常模式读源码树，reuse 模式没有源码树，
+          # 就从复用来的 Image 里抠（'Linux version 7.2.0-xaga-mt6895 ...' 的第一个词）。
+          KR="$(cat linux/include/config/kernel.release 2>/dev/null || true)"
+          if [ -z "$KR" ]; then
+            KR="$(python3 -c "import re;d=open('linux/arch/arm64/boot/Image','rb').read();m=re.search(rb'Linux version ([^\x00\n ]+)',d);print(m.group(1).decode() if m else '')" 2>/dev/null || true)"
+          fi
           {
             echo "kernel_commit=${KERNEL_COMMIT:-${{ needs.meta.outputs.kernel_commit }}}"
             echo "initramfs_commit=${INITRAMFS_COMMIT:-${{ needs.meta.outputs.initramfs_commit }}}"
-            # 内核版本串（uname -a 里那段）。reuse 模式下没有源码树，就空着。
-            echo "kernel_release=$(cat linux/include/config/kernel.release 2>/dev/null || true)"
+            echo "kernel_release=$KR"
           } >> "$GITHUB_OUTPUT"
 
       - name: "[boot] 上传 boot 产物"
         uses: actions/upload-artifact@v4
         with:
           name: kernel-output
-          # 文件名带时间戳，所以用 glob 收
+          # 文件名带时间戳，所以用 glob 收。
+          # boot 只有未压缩的 .img（不再有 .gz，见上面打包步骤的说明）。
           path: |
             out/boot-*.img
-            out/boot-*.img.gz
             out/Image-*
             out/initramfs-*
             out/kernel-*.config
@@ -1057,7 +1607,9 @@ jobs:
           if-no-files-found: error
 
       - name: "[boot] 上传内核模块"
-        if: ${{ needs.meta.outputs.build_modules == '1' && needs.meta.outputs.reuse_boot_from_run == '' }}
+        # reuse 模式也传：模块是从历史 run 搬来的，重新上传一次，
+        # 本 run 的 rootfs / release 两个 job 才拿得到（它们只认本 run 的 artifact）。
+        if: ${{ needs.meta.outputs.build_modules == '1' }}
         uses: actions/upload-artifact@v4
         with:
           name: kernel-modules
@@ -1081,7 +1633,7 @@ jobs:
       TARGET_HOSTNAME: ${{ needs.meta.outputs.hostname }}
       EXTRA_PACKAGES: ${{ needs.meta.outputs.extra_packages }}
     steps:
-      - name: Checkout 本仓库（要 usb-debug/ 里的 gadget 文件）
+      - name: Checkout 本仓库
         uses: actions/checkout@v4
 
       - name: 安装依赖
@@ -1417,44 +1969,415 @@ jobs:
               sudo cp -f /lib/firmware/regulatory.db.p7s rootfs/lib/firmware/
           fi
 
-      - name: 铺 USB 串口调试文件（gadget 服务 / udev 规则 / NM 连接）
+      # ==================================================================
+      # 以下两个步骤把原先散在 usb-debug/usb-gadget/ 与 rootfs-overlay/ 里的
+      # 文件**内联生成**（heredoc）。这么做的原因（2026-09-20 定）：
+      #   本仓库在工作流之外没有别的构建输入了 —— 推代码时少推一个目录就会
+      #   让构建静默降级（串口没了 / connlog 又开始刷屏），而且本机不是 git
+      #   仓库，漏推很难发现。内联之后**工作流自身就是唯一事实来源**。
+      # 写法说明：YAML 块标量会按第一行剥掉基准缩进，但**保留**每行多出来的空格，
+      #   所以 heredoc 每行统一多写 2 个空格，写完用 `sed -i "s/^ \{2\}//"` 精确剥掉，
+      #   文件内容与原件逐字节一致（.github/scripts/verify-inline.py 会做
+      #   sha256 锚定 + 两处逐行交叉比对来兜底，改完必须跑）。
+      # ==================================================================
+      - name: 铺 USB 串口调试文件（内联生成：gadget 服务 / udev 规则 / NM 连接）
         if: ${{ env.ROOTFS_TYPE != 'postmarketOS' }}
         run: |
           set -e
-          SRC="$GITHUB_WORKSPACE/usb-debug/usb-gadget"
-          [ -d "$SRC" ] || { echo "::warning::找不到 $SRC，跳过"; exit 0; }
-          sudo cp -a "$SRC/." rootfs/
+          sudo mkdir -p rootfs/usr/local/sbin \
+                        rootfs/etc/systemd/system \
+                        rootfs/etc/udev/rules.d \
+                        rootfs/etc/NetworkManager/system-connections
+
+          # ---- usr/local/sbin/xaga-usb-gadget ----
+          sudo tee rootfs/usr/local/sbin/xaga-usb-gadget >/dev/null <<'XAGA_EOF'
+            #!/bin/sh
+            # ============================================================================
+            # xaga USB gadget —— 把手机当 USB 设备挂到 PC 上
+            #   默认：CDC-ACM 串口（PC 认成 COM 口 / /dev/ttyACM0）→ 手机侧 /dev/ttyGS0
+            #   可选：RNDIS 网卡（ENABLE_RNDIS=1）→ 手机侧 usb0，不靠 WiFi 也能 ssh
+            #
+            # 用法：
+            #   xaga-usb-gadget            # 常驻：等 UDC 出现就绑定（systemd 服务用这个）
+            #   xaga-usb-gadget --once     # 只跑一次，绑定失败就报错退出（手动调试用）
+            #   ENABLE_RNDIS=1 xaga-usb-gadget
+            #
+            # 为什么要「等 UDC」：
+            #   xaga 是 DRD，插入 USB 线后由 TCPM（mt6375）把角色切到 device，mtu3 才会
+            #   注册 UDC（/sys/class/udc/mtu3-...），拔线或切 host 时又会注销。
+            #   上游 mtu3_dr.c 里 allow_userspace_control=false，userspace 不能强制角色，
+            #   所以只能轮询等它出现。见 MT6895-Mainline/linux commit 675f8d9f（mtu3_dr.c）
+            # ============================================================================
+            set -u
+
+            GADGET_DIR=/sys/kernel/config/usb_gadget/xaga
+            POLL_INTERVAL="${POLL_INTERVAL:-2}"
+            ENABLE_RNDIS="${ENABLE_RNDIS:-0}"
+
+            log() { echo "xaga-usb: $*"; logger -t xaga-usb -- "$*" 2>/dev/null || true; }
+
+            # ---------------------------------------------------------------- 前置检查
+            preflight() {
+                if ! grep -qs '^configfs$' /proc/filesystems; then
+                    log "错误：内核没有 configfs（需要 CONFIG_CONFIGFS_FS=y）"
+                    return 1
+                fi
+                [ -d /sys/kernel/config ] || mkdir -p /sys/kernel/config 2>/dev/null
+                grep -qs configfs /proc/mounts || \
+                    mount -t configfs none /sys/kernel/config 2>/dev/null || true
+
+                if [ ! -d /sys/kernel/config/usb_gadget ]; then
+                    # 这就是「USB 连不上」时的实际状态：内核只有 mtu3 控制器，
+                    # 没有可用的 gadget 核心。需要 CONFIG_USB_CONFIGFS=y（不能是 =m）
+                    log "错误：内核没有 configfs USB gadget 支持"
+                    log "      /sys/kernel/config/usb_gadget 不存在 → CONFIG_USB_CONFIGFS 未内建"
+                    log "      本工程只编 Image 不装模块，=m 等于没开，必须改 config 重编"
+                    return 1
+                fi
+                command -v ls >/dev/null 2>&1 || true
+                return 0
+            }
+
+            # ---------------------------------------------------------------- 建 gadget
+            setup_gadget() {
+                log "创建 gadget: $GADGET_DIR"
+                mkdir -p "$GADGET_DIR"
+                cd "$GADGET_DIR" || return 1
+
+                echo 0x1d6b > idVendor            # Linux Foundation
+                echo 0x0104 > idProduct           # Multifunction Composite Gadget
+                echo 0x0100 > bcdDevice
+                echo 0x0200 > bcdUSB
+
+                mkdir -p strings/0x409
+                echo "xaga" > strings/0x409/serialnumber
+                echo "MT6895-Mainline" > strings/0x409/manufacturer
+                echo "xaga USB debug" > strings/0x409/product
+
+                mkdir -p configs/c.1/strings/0x409
+                echo "ACM serial" > configs/c.1/strings/0x409/configuration
+                echo 250 > configs/c.1/MaxPower
+
+                # --- 串口功能：PC 侧免驱（Win10+ 自带 usbser.sys），手机侧 /dev/ttyGS0 ---
+                if [ ! -d functions/acm.usb0 ]; then
+                    mkdir -p functions/acm.usb0
+                fi
+                [ -e configs/c.1/acm.usb0 ] || ln -s functions/acm.usb0 configs/c.1/
+
+                # --- 可选：RNDIS 网卡（Windows 免驱），手机侧出现 usb0 ---
+                if [ "$ENABLE_RNDIS" = "1" ]; then
+                    if [ ! -d functions/rndis.usb0 ]; then
+                        mkdir -p functions/rndis.usb0
+                        # 固定 MAC，省得每次插拔 PC 上都多一个「新网络」
+                        echo "02:1a:11:00:00:01" > functions/rndis.usb0/dev_addr
+                        echo "02:1a:11:00:00:02" > functions/rndis.usb0/host_addr
+                    fi
+                    [ -e configs/c.1/rndis.usb0 ] || ln -s functions/rndis.usb0 configs/c.1/
+                    echo "ACM serial + RNDIS net" > configs/c.1/strings/0x409/configuration
+                fi
+
+                log "gadget 建好（functions: $(ls functions 2>/dev/null | tr '\n' ' '))"
+            }
+
+            # ---------------------------------------------------------------- 绑 UDC
+            bind_udc() {
+                udc="$1"
+                cur="$(cat "$GADGET_DIR/UDC" 2>/dev/null || true)"
+                if [ "$cur" = "$udc" ]; then
+                    return 0
+                fi
+                log "绑定 UDC: $udc（原: ${cur:-无}）"
+                echo "$udc" > "$GADGET_DIR/UDC" || { log "绑定 $udc 失败"; return 1; }
+                log "已绑定，PC 侧应出现串口设备，手机侧 /dev/ttyGS0"
+                # 主路径是 udev 规则触发 getty；这里再补一刀，防止绑定早于 udev 就绪
+                systemctl start --no-block serial-getty@ttyGS0.service 2>/dev/null || true
+                return 0
+            }
+
+            first_udc() {
+                ls /sys/class/udc 2>/dev/null | head -n1
+            }
+
+            # ---------------------------------------------------------------- main
+            preflight || exit 1
+
+            if [ "${1:-}" = "--once" ]; then
+                udc="$(first_udc)"
+                if [ -z "$udc" ]; then
+                    log "没有可用 UDC —— 先把 USB 线插到 PC 上（TCPM 切到 device 后才会出现）"
+                    log "当前 /sys/class/udc: [$(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')]"
+                    exit 1
+                fi
+                [ -d "$GADGET_DIR" ] || setup_gadget || exit 1
+                bind_udc "$udc" || exit 1
+                log "完成。串口控制台请执行: systemctl start serial-getty@ttyGS0"
+                exit 0
+            fi
+
+            # 常驻模式：UDC 拔插 / 角色切换都会重新出现，这里始终把它绑上
+            while :; do
+                udc="$(first_udc)"
+                if [ -n "$udc" ]; then
+                    if [ ! -d "$GADGET_DIR" ]; then
+                        setup_gadget || true
+                    fi
+                    bind_udc "$udc" || true
+                fi
+                sleep "$POLL_INTERVAL"
+            done
+          XAGA_EOF
+
+          # ---- etc/systemd/system/xaga-usb-gadget.service ----
+          sudo tee rootfs/etc/systemd/system/xaga-usb-gadget.service >/dev/null <<'XAGA_EOF'
+            [Unit]
+            Description=xaga USB gadget (CDC-ACM 串口控制台 / 可选 RNDIS 网卡)
+            Documentation=https://github.com/MT6895-Mainline/linux
+            # configfs 是 gadget 的必需前置；systemd 自带这个 mount unit
+            After=sys-kernel-config.mount local-fs.target
+            Wants=sys-kernel-config.mount
+            ConditionPathExists=/sys/kernel/config
+
+            [Service]
+            Type=simple
+            # 脚本内部会轮询 /sys/class/udc：xaga 是 DRD，插上线 TCPM 切到 device 后
+            # UDC 才出现，拔线又会消失，所以这里常驻而不是 oneshot。
+            ExecStart=/usr/local/sbin/xaga-usb-gadget
+            Restart=always
+            RestartSec=5
+            # 想顺便开 USB 网卡就把下面改成 1（手机侧会多出 usb0，IP 见同目录 nmconnection）
+            Environment=ENABLE_RNDIS=0
+            # 需要写 /sys，别加 ProtectKernelTunables / ProtectSystem 之类的加固项
+            StandardOutput=journal
+            StandardError=journal
+            SyslogIdentifier=xaga-usb-gadget
+
+            [Install]
+            WantedBy=multi-user.target
+          XAGA_EOF
+
+          # ---- etc/udev/rules.d/91-xaga-usb-serial.rules ----
+          sudo tee rootfs/etc/udev/rules.d/91-xaga-usb-serial.rules >/dev/null <<'XAGA_EOF'
+            # xaga USB gadget 串口（CDC-ACM）。
+            # gadget 绑定成功后内核才会创建 ttyGS0，所以必须用 udev 触发 getty，
+            # 不能在开机时无条件 enable serial-getty@ttyGS0（那时设备还不存在）。
+            # PC 侧：Windows 认成 COM 口（Win10+ 自带 usbser），Linux 是 /dev/ttyACM0。
+            KERNEL=="ttyGS*", SUBSYSTEM=="tty", TAG+="systemd", ENV{SYSTEMD_WANTS}="serial-getty@%k.service"
+          XAGA_EOF
+
+          # ---- etc/NetworkManager/system-connections/xaga-usb0.nmconnection ----
+          sudo tee rootfs/etc/NetworkManager/system-connections/xaga-usb0.nmconnection >/dev/null <<'XAGA_EOF'
+            [connection]
+            id=xaga-usb0
+            type=ethernet
+            interface-name=usb0
+            autoconnect=true
+            autoconnect-priority=10
+
+            [ethernet]
+            # RNDIS gadget 的 MAC（configfs 里写死的 02:1a:11:00:00:01）
+            mac-address=02:1A:11:00:00:01
+
+            [ipv4]
+            # 手机侧固定 10.9.0.1/24，PC 侧网络属性里手动填 10.9.0.2/24 即可 ssh。
+            # 想省掉手动配置就把 method 改成 shared（需要装 dnsmasq 做 DHCP）。
+            method=manual
+            address1=10.9.0.1/24
+            never-default=true
+
+            [ipv6]
+            method=disabled
+          XAGA_EOF
+
+          # 剥掉上面统一多写的 2 个空格，还原成与原文件逐字节一致的内容
+          for f in rootfs/usr/local/sbin/xaga-usb-gadget \
+                   rootfs/etc/systemd/system/xaga-usb-gadget.service \
+                   rootfs/etc/udev/rules.d/91-xaga-usb-serial.rules \
+                   rootfs/etc/NetworkManager/system-connections/xaga-usb0.nmconnection; do
+            sudo sed -i 's/^ \{2\}//' "$f"
+          done
+
           sudo chmod 755 rootfs/usr/local/sbin/xaga-usb-gadget
           sudo chmod 644 rootfs/etc/systemd/system/xaga-usb-gadget.service
           sudo chmod 644 rootfs/etc/udev/rules.d/91-xaga-usb-serial.rules
+          sudo chmod 600 rootfs/etc/NetworkManager/system-connections/xaga-usb0.nmconnection
           sudo mkdir -p rootfs/etc/systemd/system/multi-user.target.wants
           sudo ln -sf /etc/systemd/system/xaga-usb-gadget.service \
             rootfs/etc/systemd/system/multi-user.target.wants/xaga-usb-gadget.service
           # 刻意不 enable serial-getty@ttyGS0：ttyGS0 要等 gadget 绑定后才存在，
           # 开机无条件拉起会 device not found，交给 udev 规则按需启动。
           sudo rm -f rootfs/etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service
-          sudo chmod 600 rootfs/etc/NetworkManager/system-connections/xaga-usb0.nmconnection 2>/dev/null || true
-          echo "USB gadget 文件已铺入"
 
-      # 治内核里那句无限刷屏的 "[connlog] xxx cache is full."
-      #   conninfra 的 connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读；
-      #   conninfra/Kbuild 里 -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH 是无条件加的，
-      #   所以默认就是 LOG_TO_FILE（等用户态）。安卓有 MTK 的 connsys_log daemon 在读，
-      #   我们这套 Arch/Debian/Ubuntu rootfs 没有 -> 缓存永远满 -> 内核按 10s ratelimit
-      #   一直打警告（实测一份日志 1110 条）。修法就是自己把 /dev/fw_log_* 读掉。
-      - name: 铺 connsyslog 排水服务（消掉 [connlog] cache is full 刷屏）
+          # 自检：脚本头必须是 shebang，service 里必须有 ExecStart（防 heredoc 写残）
+          head -1 rootfs/usr/local/sbin/xaga-usb-gadget | grep -q '^#!/bin/sh$' \
+            || { echo "::error::xaga-usb-gadget 生成异常（首行不是 #!/bin/sh）"; exit 1; }
+          grep -q '^ExecStart=/usr/local/sbin/xaga-usb-gadget$' \
+            rootfs/etc/systemd/system/xaga-usb-gadget.service \
+            || { echo "::error::xaga-usb-gadget.service 生成异常（ExecStart 行不对）"; exit 1; }
+          echo "USB gadget 文件已内联生成（脚本+服务+udev+NM，共 4 个）"
+
+      - name: 铺 connsyslog 排水服务（内联生成，根治 [connlog] 刷屏）
         if: ${{ env.ROOTFS_TYPE != 'postmarketOS' }}
         run: |
           set -e
-          SRC="$GITHUB_WORKSPACE/rootfs-overlay"
-          [ -d "$SRC" ] || { echo "::warning::找不到 $SRC，跳过"; exit 0; }
-          sudo cp -a "$SRC/." rootfs/
+          sudo mkdir -p rootfs/usr/local/sbin rootfs/etc/systemd/system
+
+          # ---- usr/local/sbin/xaga-connlog-drain ----
+          sudo tee rootfs/usr/local/sbin/xaga-connlog-drain >/dev/null <<'XAGA_EOF'
+            #!/bin/sh
+            # =============================================================================
+            #  xaga-connlog-drain —— 把 MTK connsyslog 的固件日志字符设备「读走」，
+            #                       消掉内核里那句一直刷屏的 [connlog] ... cache is full
+            #
+            #  ---------------------------------------------------------------------------
+            #  为什么会有这个脚本（有源码，不是猜的）
+            #
+            #  驱动 : drivers/misc/mediatek/connectivity/conninfra/debug_utility/connsyslog/
+            #            connsyslog.c  +  fw_log_mcu.c  +  fw_log_wifi_mcu.c
+            #
+            #   connlog_ring_emi_to_cache() 干的事是：把 WiFi/BT 固件写进 EMI 的日志，
+            #   搬到内核侧的 ring_cache（容量 = emi_size * 2），**等用户态来读**：
+            #
+            #       if (RING_FULL(ring_cache)) {
+            #           pr_warn("[connlog] %s cache is full.\n", type_to_title[conn_type]);
+            #           return;
+            #       }
+            #
+            #   而 conninfra/Kbuild 里这一行是**无条件**加的：
+            #       ccflags-y += -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH
+            #   所以 g_log_mode 的初值就是 LOG_TO_FILE（等用户态读），而不是
+            #   PRINT_TO_KERNEL_LOG（直接打进内核日志）。也就是说「缓存满」不是 bug，
+            #   是「本该有人来读，但没人读」。
+            #
+            #   安卓侧由 MTK 的 connsys_log daemon 读；我们的 Arch / Debian / Ubuntu /
+            #   主线 rootfs 里没有这个 daemon → ring_cache 只进不出 → 永远满 →
+            #   内核按 ratelimit(10s) 无限刷：
+            #
+            #       [connlog] wifi_mcu cache is full.
+            #       [connlog] wifi_fw  cache is full.
+            #       [connlog] wifi_fw emi ring is empty!
+            #
+            #   （实测一份 1.5 小时的启动日志：`cache is full` 1110 条，`[connlog]` 1694 条。
+            #     把 dmesg 整个糊住了，真出问题时根本找不到有用信息。）
+            #
+            #  ---------------------------------------------------------------------------
+            #  这个脚本做的事
+            #
+            #   1. 等 /dev/fw_log_* 出现 —— 内核 fw_log_mcu_init() 用 class_create +
+            #      device_create 建的字符设备：
+            #         /dev/fw_log_wifimcu    CONN_DEBUG_TYPE_WIFI_MCU (conn_type=2)
+            #         /dev/fw_log_btmcu      CONN_DEBUG_TYPE_BT_MCU   (conn_type=3)
+            #      （驱动名见各自源码里的 #define DRIVER_NAME，所以这里用 glob 兜住，
+            #        上游改名字也不会失效。）
+            #   2. 每个设备起一个进程，一直 read() 并丢弃 → ring_cache 永远不积压 →
+            #      内核那句 pr_warn 再也不会触发。
+            #   3. 设备消失（WiFi 重载 / BT 重连）后自动重连；cat 退出也会重来。
+            #
+            #  纯只读 + 丢弃，不改任何内核状态，不占 CPU（阻塞在 read 上）。
+            #  设备根本不存在时（比如内核没编 conninfra）只是空转 sleep，无副作用。
+            #
+            #  ---------------------------------------------------------------------------
+            #  想留档固件日志？自己临时抓一段（会一直追加，别长时间跑）：
+            #      timeout 10 cat /dev/fw_log_wifimcu > /tmp/wifi_fw.bin
+            #      timeout 10 cat /dev/fw_log_btmcu   > /tmp/bt_fw.bin
+            #
+            #  想临时关掉排水（比如就是要看内核那句警告）：
+            #      systemctl stop xaga-connlog-drain
+            # =============================================================================
+            set -u
+
+            # 内核建出来的字符设备名（conninfra/Kbuild 只要开了 connsyslog 就会有）
+            DEV_GLOB='/dev/fw_log_*'
+            # 轮询间隔（秒）。比它更短没意义：设备只在 WiFi/BT probe 时才出现。
+            INTERVAL="${XAGA_CONNLOG_POLL:-5}"
+
+            log() { echo "xaga-connlog: $*"; }
+
+            # 单个设备的守护：读 → 断了就等一会重读
+            drain_one() {
+                dev="$1"
+                while :; do
+                    if [ -c "$dev" ]; then
+                        log "draining $dev"
+                        cat "$dev" >/dev/null 2>&1
+                        log "$dev closed, retry in ${INTERVAL}s"
+                    fi
+                    sleep "$INTERVAL"
+                done
+            }
+
+            # 收到 SIGTERM/SIGINT 就退出。这里刻意**不**用 kill 0：systemd 默认
+            # KillMode=control-group，停服务时会把整个 cgroup（本脚本 + drain_one 子 shell +
+            # 里面的 cat）一起收掉，自己再去 kill 进程组反而会把自己也打死。
+            trap 'trap - TERM INT; exit 0' TERM INT
+
+            seen=''
+            log "started, waiting for $DEV_GLOB (poll ${INTERVAL}s)"
+
+            while :; do
+                for dev in $DEV_GLOB; do
+                    # glob 没匹配到时字面量会被展开一次，这里挡掉
+                    [ -c "$dev" ] || continue
+                    case " $seen " in
+                        *" $dev "*) continue ;;
+                    esac
+                    seen="$seen $dev"
+                    drain_one "$dev" &
+                done
+                sleep "$INTERVAL"
+            done
+          XAGA_EOF
+
+          # ---- etc/systemd/system/xaga-connlog-drain.service ----
+          sudo tee rootfs/etc/systemd/system/xaga-connlog-drain.service >/dev/null <<'XAGA_EOF'
+            [Unit]
+            Description=xaga: drain MTK connsyslog FW-log chardevs (stop "[connlog] ... cache is full" spam)
+            # 背景见 /usr/local/sbin/xaga-connlog-drain 的文件头：
+            # conninfra 的 connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读，
+            # 没有 reader 就一直满，内核按 10s 一次 ratelimit 无限刷 "[connlog] xxx cache is full."
+            Documentation=file:/usr/local/sbin/xaga-connlog-drain
+            After=local-fs.target
+            Wants=local-fs.target
+
+            [Service]
+            Type=simple
+            ExecStart=/usr/local/sbin/xaga-connlog-drain
+
+            # 刻意**不**加 ConditionPathExistsGlob=/dev/fw_log_*：
+            # 这些字符设备要等 WiFi/BT 驱动 probe 之后才出现，加条件会让本服务在开机那一刻
+            # 被判「条件不满足」直接跳过、并且再也不拉起。等设备的事交给脚本自己的轮询循环。
+            #
+            # 设备消失 / cat 退出都要能自愈，所以是 always。
+            Restart=always
+            RestartSec=5
+
+            # 纯后台排水：阻塞在 read() 上，几乎不吃 CPU，也不写盘
+            Nice=19
+            IOSchedulingClass=idle
+            CPUWeight=10
+            IOWeight=10
+            MemoryMax=64M
+
+            StandardOutput=journal
+            StandardError=journal
+
+            [Install]
+            WantedBy=multi-user.target
+          XAGA_EOF
+
+          sudo sed -i 's/^ \{2\}//' rootfs/usr/local/sbin/xaga-connlog-drain \
+                                    rootfs/etc/systemd/system/xaga-connlog-drain.service
           sudo chmod 755 rootfs/usr/local/sbin/xaga-connlog-drain
           sudo chmod 644 rootfs/etc/systemd/system/xaga-connlog-drain.service
           sudo mkdir -p rootfs/etc/systemd/system/multi-user.target.wants
           sudo ln -sf /etc/systemd/system/xaga-connlog-drain.service \
             rootfs/etc/systemd/system/multi-user.target.wants/xaga-connlog-drain.service
-          echo "connsyslog 排水服务已铺入（开机自启，读 /dev/fw_log_* 并丢弃，设备晚出现也能自愈）"
+
+          head -1 rootfs/usr/local/sbin/xaga-connlog-drain | grep -q '^#!/bin/sh$' \
+            || { echo "::error::xaga-connlog-drain 生成异常（首行不是 #!/bin/sh）"; exit 1; }
+          grep -q '^ExecStart=/usr/local/sbin/xaga-connlog-drain$' \
+            rootfs/etc/systemd/system/xaga-connlog-drain.service \
+            || { echo "::error::xaga-connlog-drain.service 生成异常（ExecStart 行不对）"; exit 1; }
+          echo "connsyslog 排水服务已内联生成（脚本+服务，开机自启，读 /dev/fw_log_* 并丢弃）"
 
       - name: 预置 WiFi（可选）
         if: ${{ env.ROOTFS_TYPE != 'postmarketOS' && needs.meta.outputs.wifi_ssid != '' }}
@@ -1527,7 +2450,7 @@ jobs:
           echo "STAMP=$STAMP" >> "$GITHUB_ENV"
           echo "本次 rootfs 时间戳: $STAMP"
 
-          echo "=== 打包 ${IMG_SIZE_GB}G ext4 ==="
+          echo "=== 打包 ${IMG_SIZE_GB}G ext4（只留 sparse + 压缩件）==="
           mkdir -p out
           ROOTFS_IMG="out/rootfs-${STAMP}.img"
           SPARSE_IMG="out/rootfs-sparse-${STAMP}.img"
@@ -1536,18 +2459,93 @@ jobs:
           sudo e2fsck -fy "$ROOTFS_IMG" || true
           img2simg "$ROOTFS_IMG" "$SPARSE_IMG"
           ls -lh out/
+
+          # 完整 ext4（约 ${IMG_SIZE_GB}G）只在本地调试时才有意义：
+          # 刷机用的本来就是 sparse。直接删掉，省下数 GB 的 artifact 传输与存储。
+          rm -f "$ROOTFS_IMG"
+
+          # rootfs **必须压缩**后再发布：sparse 1.7G -> ~730M，是 Release 里唯一的大件。
+          # （boot 恰好相反 —— 它内部已是压缩数据，压了只省 2% 还会多一个易刷错的 .gz。）
+          echo "=== pigz 压缩 $(basename "$SPARSE_IMG") ==="
+          pigz -9 -k -f "$SPARSE_IMG"
+          gzip -t "${SPARSE_IMG}.gz"
+          echo "  $(numfmt --to=iec "$(stat -c%s "$SPARSE_IMG")") -> $(numfmt --to=iec "$(stat -c%s "${SPARSE_IMG}.gz")")"
+          rm -f "$SPARSE_IMG"
+
           cd out
-          sha256sum "rootfs-${STAMP}.img" "rootfs-sparse-${STAMP}.img" \
-            > "ROOTFS_SHA256SUMS-${STAMP}.txt"
+          ls -lh
+          sha256sum "rootfs-sparse-${STAMP}.img.gz" > "ROOTFS_SHA256SUMS-${STAMP}.txt"
           cat "ROOTFS_SHA256SUMS-${STAMP}.txt"
 
       - name: 上传 RootFS 产物
         uses: actions/upload-artifact@v4
         with:
           name: rootfs-output
-          # 文件名带时间戳，用 glob 收（rootfs-<戳>.img / rootfs-sparse-<戳>.img）
+          # 文件名带时间戳，用 glob 收。
+          # 只传压缩后的 sparse（~730M）：未压缩的 sparse（~1.7G）和完整 ext4（数 GB）
+          # 都在上面的打包步骤里删掉了 —— artifact 传输与存储省一大截。
           path: |
-            out/rootfs*.img
+            out/rootfs-sparse-*.img.gz
+            out/ROOTFS_SHA256SUMS*.txt
+          if-no-files-found: error
+
+  # ==========================================================================
+  # Job 2b: 复用历史 RootFS（REUSE_ROOTFS_FROM_RUN）
+  #
+  #   rootfs 只在 userdata 上刷一次，之后长期不动；反复刷 boot.img 调内核时没必要
+  #   每次都重跑 100 分钟的 rootfs 构建（pacman/apt 拉包 + chroot 配置才是大头）。
+  #
+  #   填了 REUSE_ROOTFS_FROM_RUN 时 meta 会把 do_rootfs 置 false（rootfs job 直接跳过，
+  #   不产出同名 artifact），改由本 job 把那次 run 的 rootfs-output 原样搬过来，
+  #   Release 里就还是完整的一套（新 boot.img + 旧 rootfs）。
+  #
+  #   产物文件名里的时间戳**故意不改成当前的** —— 一眼能看出 rootfs 是哪次构建的，
+  #   不会让人误以为它和同包的 boot.img 一样新。
+  #
+  #   （job id 用下划线不用连字符：带 - 的 job id 在表达式里引用容易踩坑，
+  #     needs.rootfs_reuse.result 这种写法是稳的。）
+  # ==========================================================================
+  rootfs_reuse:
+    name: 复用历史 RootFS
+    needs: [meta]
+    if: ${{ always() && needs.meta.outputs.should_build == 'true' && needs.meta.outputs.reuse_rootfs_from_run != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 下载历史 rootfs 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-output
+          path: out
+          run-id: ${{ needs.meta.outputs.reuse_rootfs_from_run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          if-no-files-found: error
+
+      - name: 校验复用的 rootfs 产物
+        run: |
+          set -e
+          ls -lh out
+          cd out
+          shopt -s nullglob
+          SPARSE=(rootfs-sparse-*.img.gz)
+          if [ ${#SPARSE[@]} -eq 0 ]; then
+            echo "::error::复用的 run ${{ needs.meta.outputs.reuse_rootfs_from_run }} 里没有 rootfs-sparse-*.img.gz"
+            echo "::error::（那个 run 可能是「仅编译内核」模式，或其 rootfs job 失败了 —— 失败就不会上传 artifact）"
+            exit 1
+          fi
+          echo "复用产物: ${SPARSE[*]}"
+          # 顺手校验那次构建留下的 sha256 清单，确认搬运过程没坏
+          for f in ROOTFS_SHA256SUMS-*.txt; do
+            sha256sum -c "$f"
+          done
+          shopt -u nullglob
+
+      - name: 上传 rootfs 产物（沿用 artifact 名，release 那边不用改）
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-output
+          path: |
+            out/rootfs-sparse-*.img.gz
             out/ROOTFS_SHA256SUMS*.txt
           if-no-files-found: error
 
@@ -1556,7 +2554,7 @@ jobs:
   # ==========================================================================
   release:
     name: 汇总产物并发布
-    needs: [meta, kernel, rootfs]
+    needs: [meta, kernel, rootfs, rootfs_reuse]
     if: ${{ always() && needs.meta.outputs.should_build == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -1604,33 +2602,94 @@ jobs:
             exit 1
           fi
 
-      - name: 压缩产物（pigz，超 2GB 自动分卷）
+      - name: 汇总产物（boot / Image 不压，rootfs 已压好）
         if: ${{ needs.meta.outputs.compress == '1' }}
         run: |
           set -e
           mkdir -p out
           cd out
           shopt -s nullglob
-          # 产物名带时间戳，直接遍历目录里的 .img（boot-<戳>.img / rootfs-<戳>.img /
-          # rootfs-sparse-<戳>.img 一次覆盖）。
-          # modules-<戳>.tar.gz 本身就是压缩包，不再压第二遍。
-          for f in *.img; do
+
+          # 各产物的压缩策略（2026-09-20 起）：
+          #
+          #   boot-<戳>.img        **不压缩**。内部已经是 gzip 的 Image + LZ4 的 ramdisk，
+          #                        再压只省 2%（20.5 MiB -> 20.1 MiB），却会多出一个极易
+          #                        被误刷的 .gz：fastboot 不校验内容，把 gzip 数据写进 boot
+          #                        分区后 LK 读不到 `ANDROID!` magic，表现是**卡在第一 logo
+          #                        反复重启**，而 fastboot 全程不报错（2026-09-20 实际踩过，
+          #                        见 README §8.4）。现在 Release 里 boot 只有 .img 本体。
+          #
+          #   Image-<戳>           **不压缩**，永久存档（约 40MB）。这是「复用资源」的钥匙：
+          #                        想复用某次构建的内核时直接从 Release 下这个文件，不受
+          #                        artifact 90 天过期的限制；它 + initramfs-<戳>.cpio.lz4
+          #                        就是 REUSE_BOOT_FROM_RUN 需要的那两份打包输入。
+          #   Image-<戳>.gz        kernel job 顺手压的存档件，与未压缩件并存。
+          #   initramfs-*.cpio.lz4 本身就是 LZ4 数据，不压。
+          #   rootfs-sparse-*.img.gz  rootfs job 里已 pigz 压好（1.7G -> ~730M），
+          #                        这里只补 .sha256 与超限分卷。
+          #   modules-*.tar.gz     已是压缩包，不再压第二遍。
+
+          for f in boot-*.img Image-* initramfs-*.cpio.lz4; do
+            [ -e "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+            echo "原样发布: $f  ($(numfmt --to=iec "$(stat -c%s "$f")"))"
+          done
+
+          # rootfs 正常已由 rootfs job 压好；万一是旧 artifact 带来的未压缩件，就地补压
+          for f in rootfs*.img; do
             [ -f "$f" ] || continue
             echo "=== 处理 $f ==="
             if [ -f "$f.gz" ]; then
-              # kernel job 打完包就顺手 gzip 了（boot-<戳>.img.gz），直接采用
               gzip -t "$f.gz" || { echo "::error::$f.gz 损坏"; exit 1; }
-              echo "  已有 $f.gz（构建 job 压好的），不再重复压"
+              echo "  已有 $f.gz（rootfs job 压好的），不再重复压"
             else
               ORIG=$(stat -c%s "$f")
               pigz -9 -k -f "$f"
               gzip -t "$f.gz"
-              NEW=$(stat -c%s "$f.gz")
-              echo "  $(numfmt --to=iec "$ORIG") -> $(numfmt --to=iec "$NEW")"
+              echo "  $(numfmt --to=iec "$ORIG") -> $(numfmt --to=iec "$(stat -c%s "$f.gz")")"
             fi
             sha256sum "$f.gz" > "$f.gz.sha256"
-            rm -f "$f"
+            rm -f "$f"     # 未压缩 rootfs 数 GB，不发布
           done
+
+          # 守卫 1：boot 的未压缩本体必须在 —— Release 里绝不能只剩压缩包
+          BOOTIMG=(boot-*.img)
+          if [ ${#BOOTIMG[@]} -eq 0 ]; then
+            echo "::error::out/ 里没有 boot-*.img（未压缩的那份）。"
+            echo "::error::用户 fastboot flash 的就是它；少了它说明上游 kernel job 没产出/没上传 artifact。"
+            exit 1
+          fi
+          echo "可直接刷的 boot 本体: ${BOOTIMG[*]}"
+
+          # 守卫 3：复用输入必须在 —— Image-<戳>.gz + initramfs-<戳>.cpio.lz4
+          #   这两份是 REUSE_BOOT_FROM_RUN 唯一需要的东西（见 §4.2）：
+          #     Image-<戳>.gz          = mkbootimg 的 --kernel（内核段）
+          #     initramfs-<戳>.cpio.lz4 = mkbootimg 的 --ramdisk（ramdisk 段）
+          #   少了任何一个，下游就没法「复用打包输入」，只能重新编内核（约 20 分钟）。
+          #   所以宁可构建失败，也不让一次静默的产物缺失悄悄废掉复用能力。
+          IMGGZ=(Image-*.gz)
+          if [ ${#IMGGZ[@]} -eq 0 ]; then
+            echo "::error::out/ 里没有 Image-*.gz —— 复用输入缺失。"
+            echo "::error::它由 kernel job 打包步骤生成（gzip -n -9 -c Image > Image-<戳>.gz），"
+            echo "::error::少了它说明该 job 没产出/没上传 artifact。"
+            exit 1
+          fi
+          IRCPIO=(initramfs-*.cpio.lz4)
+          if [ ${#IRCPIO[@]} -eq 0 ]; then
+            echo "::error::out/ 里没有 initramfs-*.cpio.lz4 —— 复用输入缺失。"
+            echo "::error::mkbootimg 的 --ramdisk 用的就是它（由自编 initramfs 压出来的）。"
+            exit 1
+          fi
+          echo "复用输入齐备: ${IMGGZ[*]} / ${IRCPIO[*]}"
+
+          # 守卫 2：rootfs 的压缩件（本次唯一的大件，缺了 rootfs 就白构建）
+          ROOTFSGZ=(rootfs-sparse-*.img.gz)
+          if [ ${#ROOTFSGZ[@]} -eq 0 ]; then
+            echo "::warning::out/ 里没有 rootfs-sparse-*.img.gz —— 要么本次 TASK 不含 rootfs，"
+            echo "::warning::要么 rootfs job 失败了。Release 里将没有 rootfs。"
+          else
+            echo "rootfs 压缩件: ${ROOTFSGZ[*]}"
+          fi
 
           # GitHub Release 单附件上限 2GiB，超了就分卷
           LIMIT=$(numfmt --from=iec "$SPLIT_SIZE")
@@ -1652,6 +2711,8 @@ jobs:
         env:
           KC: ${{ needs.kernel.outputs.kernel_commit }}
           IC: ${{ needs.kernel.outputs.initramfs_commit }}
+          REUSE_BOOT: ${{ needs.meta.outputs.reuse_boot_from_run }}
+          REUSE_ROOTFS: ${{ needs.meta.outputs.reuse_rootfs_from_run }}
         run: |
           set -e
           cd out
@@ -1663,6 +2724,8 @@ jobs:
           Run      : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           任务     : ${{ needs.meta.outputs.task }}
           触发     : ${{ github.event_name }}（${{ needs.meta.outputs.build_reason }}）
+          产物复用 : $( [ -n "$REUSE_BOOT" ] && echo "内核产物（Image + initramfs + modules）复用自 run $REUSE_BOOT；boot.img 是本次重新打包的（不是搬旧包），打包参数改动会生效" || echo "boot.img 本次编译" )
+                     $( [ -n "$REUSE_ROOTFS" ] && echo "rootfs 复用自 run $REUSE_ROOTFS（本次未构建）—— 文件名里的戳是那次构建的时间戳" || echo "rootfs 本次构建" )
 
           ============================================================
            产物清单（文件名里的 YYYYmmdd-HHMMSS 是构建完成时间戳）
@@ -1672,9 +2735,9 @@ jobs:
           --- boot.img ---
           内核仓库   : $KERNEL_REPO_URL
           内核分支   : ${{ needs.meta.outputs.kernel_branch }}
-          内核 commit: ${KC:-（复用的历史产物 / 本次未构建）}
+          内核 commit: ${KC:-（复用内核产物 / 本次未构建）}
           initramfs  : ${IC:-（本次未构建）}
-          内核版本串 : ${{ needs.kernel.outputs.kernel_release || '（复用/未构建）' }}
+          内核版本串 : ${{ needs.kernel.outputs.kernel_release || '（未构建）' }}
                        ^ 开机后 uname -a 会显示 Linux <这个版本串> ...
           打包参数   : base=$KERNEL_BASE kernel_offset=$KERNEL_OFFSET pagesize=$PAGESIZE
                        ramdisk_offset=$RAMDISK_OFFSET tags_offset=$TAGS_OFFSET
@@ -1693,12 +2756,19 @@ jobs:
           ============================================================
            开机后该知道的两件事（日志相关的坑，已在构建里处理）
           ============================================================
-          * [connlog] wifi_mcu / wifi_fw cache is full.  无限刷屏（实测一份日志 1110 条）
-              connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读，没人读就一直满，
-              内核按 10s ratelimit 无限打警告。安卓有 MTK 的 daemon 在读，我们的 rootfs 没有。
-              rootfs 里已装 xaga-connlog-drain（开机自启）：把 /dev/fw_log_* 读走即可，
-              不需要重编内核。排查: systemctl status xaga-connlog-drain
-              想临时看那条警告: systemctl stop xaga-connlog-drain
+          * [connlog] wifi_mcu / wifi_fw cache is full.  无限刷屏
+              —— 已由 rootfs 里的常驻服务 xaga-connlog-drain 消掉，不会出现。
+              根因：connsyslog 把 WiFi/BT 固件日志搬进内核 ring_cache 等用户态读；
+              安卓有 MTK 的 connsys_log daemon 在读，我们这套 rootfs 没有，缓存永远满，
+              于是内核按 10s ratelimit 无限 pr_warn（实测一份日志 1110 条）。
+              上游把这开关硬编码在构建脚本里（connectivity/Makefile 的
+              `export CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH := y` 与 conninfra/Kbuild 的
+              无条件 `ccflags-y += -D...`），**只改 .config 是无效的**；而本构建不动上游源码
+              （产物必须与上游 commit 一一对应），所以改在用户态：装个常驻服务把
+              /dev/fw_log_* 读走即可，不需要重编内核。
+              排查   : systemctl status xaga-connlog-drain
+              想复现 : systemctl stop xaga-connlog-drain（停掉它，那条警告就会回来）
+              自查:  dmesg | grep -c connlog          # 应为 0
 
           * SCP 每 ~3 分钟崩一次（scp_crash_dump / scp_aed TIMEOUT / IPI #29 timeout /
             MBOX Error / sensorhub 每 3 分钟重新注册 32 个传感器）
@@ -1711,10 +2781,17 @@ jobs:
           ============================================================
           0) 文件名都带时间戳，例如 boot-20260920-104630.img。
              刷机前用 shell 通配挑最新那份最省事：
-               BOOT=$(ls -t boot-*.img.gz | head -1)        # 下载下来的 boot 压缩包
+               BOOT=$(ls -t boot-*.img | head -1)               # boot 只有未压缩的 .img
                ROOTFS=$(ls -t rootfs-sparse-*.img.gz | head -1)
-          1) 解压（只有 .img 本体不压缩，其余产物都是 .gz）
-             Linux/macOS : gunzip -k boot-20260920-104630.img.gz
+
+             boot 现在**只发布未压缩的 .img**（不再生成 .gz）：
+               一来 boot.img 内部已是 gzip 的 Image + LZ4 的 ramdisk，压了只省 2%；
+               二来 fastboot 不校验内容，把 gzip 数据写进 boot 分区后 LK 读不到
+               ANDROID! magic，表现是**卡在第一 logo 反复重启**且全程不报错
+               （2026-09-20 实际踩过）。没有 .gz 就没有刷错的机会。
+               自查一行：head -c 8 boot-<戳>.img   # 必须输出 ANDROID!
+          1) 解压：boot 不用解压（.img 已在包里）。rootfs 只有 .gz，需要先解：
+             Linux/macOS : gunzip -k rootfs-sparse-<戳>.img.gz
              Windows     : 7-Zip / WinRAR 直接解 .gz
           2) 如果看到 .gz.part-00 / .gz.part-01 ...，说明单文件超 2GB 被分卷，先合并：
              Linux/macOS : cat rootfs-sparse-<戳>.img.gz.part-* > rootfs-sparse.img.gz && gunzip rootfs-sparse.img.gz
@@ -1749,14 +2826,27 @@ jobs:
           ============================================================
            校验
           ============================================================
-          每个 .img.gz 旁边都有 .img.gz.sha256，直接校验压缩包本身：
-            sha256sum -c boot-<戳>.img.gz.sha256
+          每个发布件旁边都有同名 .sha256，直接核：
+            sha256sum -c boot-<戳>.img.sha256
+            sha256sum -c Image-<戳>.sha256
+            sha256sum -c rootfs-sparse-<戳>.img.gz.sha256
           分卷产物另有 .gz.whole-sha256，是合并后整体的哈希。
-          SHA256SUMS-<戳>.txt 是**未压缩**产物的哈希清单 —— 发布到 Release 时
-          原始 .img 已被 gz 替换，所以它用来核对 gunzip 出来的文件：
-            gunzip -k boot-<戳>.img.gz && sha256sum -c SHA256SUMS-<戳>.txt
+          SHA256SUMS-<戳>.txt 是构建时产物的哈希清单（含 Image 的未压缩件）。
           内核完整配置在 kernel-<戳>.config（从镜像里 IKCFG 抠出来的），
           和 usb-debug/reference/ 里的基线 diff 就知道配置动了什么。
+
+          ============================================================
+           复用构建（省一次 ~20 分钟的编译）
+          ============================================================
+          这里是**永久存档**（Release 不会过期；artifact 只有 90 天），里面放着完整的
+          「打包输入」：
+            Image-<戳>               未压缩内核
+            initramfs-<戳>.cpio.lz4  ramdisk
+            modules-<戳>.tar.gz      内核模块
+          所以即便 artifact 过期了，仍能从这份 Release 里拿回输入、手工重打 boot.img
+          （mkbootimg 参数见本文件上面的「打包参数」）。
+          工作流内置的自动复用（TASK 里填 REUSE_BOOT_FROM_RUN / REUSE_ROOTFS_FROM_RUN）
+          读的是同仓库的 artifact —— 90 天内的 run 可直接复用；更早的就从这里手工取。
           EOF
           ls -lh README.txt
 
@@ -1789,7 +2879,7 @@ jobs:
   # ==========================================================================
   notify:
     name: 通知 & 记录状态
-    needs: [meta, kernel, rootfs, release]
+    needs: [meta, kernel, rootfs, rootfs_reuse, release]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1802,7 +2892,8 @@ jobs:
         run: |
           set -e
           OVERALL=success
-          for r in "${{ needs.kernel.result }}" "${{ needs.rootfs.result }}" "${{ needs.release.result }}"; do
+          for r in "${{ needs.kernel.result }}" "${{ needs.rootfs.result }}" \
+                   "${{ needs.rootfs_reuse.result }}" "${{ needs.release.result }}"; do
             case "$r" in
               failure|cancelled) OVERALL=failure ;;
             esac
