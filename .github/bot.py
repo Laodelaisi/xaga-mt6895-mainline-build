@@ -517,7 +517,13 @@ def cmd_notify(args):
 # --------------------------------------------------------------------------- #
 # 5. 产物校验（把 python 逻辑放在这个文件里，工作流就不用在 YAML 里写 heredoc）
 # --------------------------------------------------------------------------- #
-BOOT_HDR_SIZE_V4 = 1584
+BOOT_HDR_SIZE_V3 = 1580        # sizeof(boot_img_hdr_v3)
+BOOT_HDR_SIZE_V4 = 1584        # sizeof(boot_img_hdr_v4) = v3 + uint32 signature_size
+BOOT_HDR_OFF_SIZE = 0x14       # header_size 字段
+BOOT_HDR_OFF_VERSION = 0x28    # header_version 字段
+# 注：这里不做「补正畸形 v4 头」那种后处理 —— header_size 写不对就说明打包器
+# 选错了（osm0sis C 版只实现到 boot_img_hdr_v3，恒写 1580），该换 AOSP 官方
+# python 版重打，见工作流「准备 AOSP 版 mkbootimg」一步。
 
 
 def cmd_verify_bootimg(args):
@@ -537,8 +543,8 @@ def cmd_verify_bootimg(args):
     ksize = _s.unpack_from("<I", d, 0x08)[0]
     rsize = _s.unpack_from("<I", d, 0x0c)[0]
     osver = _s.unpack_from("<I", d, 0x10)[0]
-    hsize = _s.unpack_from("<I", d, 0x14)[0]
-    hver = _s.unpack_from("<I", d, 0x28)[0]
+    hsize = _s.unpack_from("<I", d, BOOT_HDR_OFF_SIZE)[0]
+    hver = _s.unpack_from("<I", d, BOOT_HDR_OFF_VERSION)[0]
 
     log("    magic          : %s" % magic.decode("latin-1"))
     log("    kernel_size    : %d (%.2f MB)" % (ksize, ksize / 1048576))
@@ -553,7 +559,15 @@ def cmd_verify_bootimg(args):
     if hver != 4:
         bad.append("header_version 应为 4，实际 %d" % hver)
     if hsize != BOOT_HDR_SIZE_V4:
-        bad.append("header_size 应为 %d，实际 %d" % (BOOT_HDR_SIZE_V4, hsize))
+        if hver == 4 and hsize == BOOT_HDR_SIZE_V3:
+            bad.append(
+                "header_size 应为 %d，实际 %d —— 这是「只实现到 boot_img_hdr_v3」的打包器"
+                "写出来的畸形 v4 头（osm0sis C 版 mkbootimg 的 header_size 恒为 1580，"
+                "它没有 v4 结构）。改用 AOSP 官方 python 版重新打包："
+                "见工作流「准备 AOSP 版 mkbootimg」一步（apt install mkbootimg + gki stub）。"
+                % (BOOT_HDR_SIZE_V4, hsize))
+        else:
+            bad.append("header_size 应为 %d，实际 %d" % (BOOT_HDR_SIZE_V4, hsize))
     if ksize == 0:
         bad.append("kernel 段为空")
     if rsize == 0:
@@ -589,6 +603,11 @@ def cmd_inspect_image(args):
     s, e = raw.find(b"IKCFG_ST"), raw.find(b"IKCFG_ED")
     if s < 0 or e < 0:
         log("    IKCFG 标记不存在（CONFIG_IKCONFIG 没开？）")
+        # 要断言却读不到 .config —— 必须失败。静默跳过等于把「卡第一 logo」那类
+        # 配置事故的最后一关直接放空（arm64 defconfig 带 IKCONFIG=y，读不到就是异常）。
+        if args.assert_y or args.assert_n:
+            log("!! 要求断言却拿不到内嵌 .config，无法校验（不要在这种情况下放过镜像）")
+            return 1
         return 0
 
     blob = raw[s + 8:e]
@@ -601,12 +620,18 @@ def cmd_inspect_image(args):
             continue
     if cfg is None:
         log("    IKCFG 段 gzip 解压失败")
+        if args.assert_y or args.assert_n:
+            log("!! 要求断言却解不开内嵌 .config，无法校验")
+            return 1
         return 0
 
     keys = args.keys or [
         "CONFIG_USB_GADGET", "CONFIG_USB_LIBCOMPOSITE", "CONFIG_USB_CONFIGFS",
         "CONFIG_USB_F_ACM", "CONFIG_USB_U_SERIAL", "CONFIG_USB_CONFIGFS_ACM",
         "CONFIG_CONFIGFS_FS", "CONFIG_MODULES", "CONFIG_CRYPTO_USER",
+        # 外部 ramdisk / DTB bootargs 形态（2026-09-20 卡第一 logo 就栽在这两个上）
+        "CONFIG_INITRAMFS_SOURCE", "CONFIG_INITRAMFS_FORCE",
+        "CONFIG_CMDLINE_FORCE", "CONFIG_CMDLINE_FROM_BOOTLOADER",
     ]
     for k in keys:
         hit = re.search(r"^%s=.*$" % re.escape(k), cfg, re.M)
@@ -626,6 +651,18 @@ def cmd_inspect_image(args):
             log("!! 断言失败，以下项不是 =y: %s" % " ".join(missing))
             return 1
         log("    OK: %s 全部 =y" % " ".join(args.assert_y))
+
+    # 「必须没开」的断言。缺项（压根没这一行）算通过 —— 正是我们要的那种状态；
+    # 只有显式 =y 才算失败。用在本工程最致命的两个开关上：
+    #   CONFIG_INITRAMFS_FORCE=y  → 内核无视 bootloader 传入的 ramdisk（外部 initramfs 方案直接废）
+    #   CONFIG_CMDLINE_FORCE=y    → 丢弃内嵌 DTB 的 /chosen/bootargs
+    if args.assert_n:
+        bad = [k for k in args.assert_n
+               if re.search(r"^%s=y$" % re.escape(k), cfg, re.M)]
+        if bad:
+            log("!! 断言失败，以下项不该 =y: %s" % " ".join(bad))
+            return 1
+        log("    OK: %s 均未开启" % " ".join(args.assert_n))
     return 0
 
 
@@ -698,6 +735,8 @@ def build_parser():
     g.add_argument("image", help="Image 路径")
     g.add_argument("--keys", nargs="*", default=None, help="要打印的 CONFIG_* 列表")
     g.add_argument("--assert-y", nargs="*", default=None, help="这些项必须 =y，否则返回非零")
+    g.add_argument("--assert-n", nargs="*", default=None,
+                   help="这些项必须**没有** =y（未开 / 未设），否则返回非零")
     g.add_argument("--dump", default="", help="把完整 .config 写到指定文件")
     g.set_defaults(func=cmd_inspect_image)
 
