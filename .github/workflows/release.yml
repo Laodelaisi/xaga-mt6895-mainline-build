@@ -108,11 +108,25 @@ jobs:
           fi
           repo="${{ github.repository }}"
           # GitHub Release 单文件上限 2GB: 超限的留在 Action Artifacts 里
-          mapfile -t files < <(find out -type f -size -2000000000c | sort)
+          mapfile -t allfiles < <(find out -type f -size -2000000000c | sort)
+          # 同一个产物会同时出现在 all-artifacts(汇总) 和单独的 *-image artifact 里,
+          # Release 不允许同名 asset, 必须按 basename 去重, 否则 422 ReleaseAsset.name already exists
+          declare -A seen=()
+          files=()
+          for f in "${allfiles[@]}"; do
+            b="$(basename "$f")"
+            if [ -z "${seen[$b]:-}" ]; then
+              seen[$b]="$f"
+              files+=("$f")
+            else
+              echo "跳过同名: $f (已选 ${seen[$b]})"
+            fi
+          done
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::没有可发布的产物 (单文件上限 2GB, 大文件请从 Action Artifacts 下载)"
             exit 1
           fi
+          echo "--- 待发布 (${#files[@]} 个) ---"
           printf '%s\n' "${files[@]}"
           if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
             echo "Release $tag 已存在, 改成追加上传"
