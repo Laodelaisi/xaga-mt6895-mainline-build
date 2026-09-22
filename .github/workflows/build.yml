@@ -360,6 +360,121 @@ jobs:
           gzip -n -9 -c arch/arm64/boot/Image > "../out/Image-${TS}.gz"
           ls -l "../out/Image-${TS}.gz"
 
+      - name: 断言 Image 内嵌了 xaga 板级 DTB
+        if: ${{ env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '' }}
+        run: |
+          set -euo pipefail
+          # xaga 的 DTB 是 objcopy 链进 vmlinux 的 (不是 appended), 所以 mkbootimg 不能传 --dtb。
+          # 万一哪天上游改了嵌入方式 / defconfig 把 DTB 弄丢了, 编出来的镜像能打包能过头部校验,
+          # 但刷上就是黑屏 —— 这里直接拦住。
+          python3 - linux/arch/arm64/boot/Image <<'PY'
+          import sys
+
+          path = sys.argv[1]
+          MAGIC = b"\xd0\x0d\xfe\xed"
+          CHUNK = 8 << 20
+          WINDOW = 65536
+          hits, with_xaga = [], []
+          with open(path, "rb") as f:
+              prev = b""
+              base = 0
+              while True:
+                  buf = f.read(CHUNK)
+                  if not buf:
+                      break
+                  data = prev + buf
+                  start = 0
+                  while True:
+                      i = data.find(MAGIC, start)
+                      if i < 0:
+                          break
+                      hits.append(base + i)
+                      if b"xaga" in data[i:i + WINDOW]:
+                          with_xaga.append(base + i)
+                      start = i + 1
+                  base = base + len(data) - 8
+                  prev = data[-8:]
+          print("Image 里 DTB magic(d00dfeed) 命中 %d 处: %s" % (len(hits), hits[:5]))
+          print("其中附近带 'xaga' 字符串的: %s" % (with_xaga[:5] or "无"))
+          if not hits:
+              print("::error::Image 里一个 DTB magic 都没有 —— 板级 DTB 没编进去, 别打包")
+              sys.exit(1)
+          if not with_xaga:
+              print("::warning::找到 DTB 但附近没有 'xaga' 字符串, 人工确认一下是不是对的板级 DTB")
+          PY
+
+      - name: 打印内嵌 DTB 的 reserved-memory (排障用)
+        if: ${{ env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '' }}
+        run: |
+          set -euo pipefail
+          # MT6895 的 ATF/TEE/SCP/SSPM/MCUPM 内存是 bootloader 占着的, 必须靠 reserved-memory
+          # 从内核手里划出去。上游有一次把这些地址整体改写过, 结果内核把活着的固件内存当普通
+          # 内存分配, DMA 一踩页表就随机崩 (过 logo 后黑屏重启)。这里把表打进日志, 出问题时
+          # 跟上一份能启动的对比一眼就能看出来。
+          python3 - linux/arch/arm64/boot/Image <<'PY'
+          import struct
+          import sys
+
+          path = sys.argv[1]
+          with open(path, "rb") as f:
+              raw = f.read()
+
+          base = raw.find(b"\xd0\x0d\xfe\xed")
+          if base < 0:
+              print("::error::Image 里找不到 DTB magic, 板级 DTB 没编进去")
+              sys.exit(1)
+
+          magic, totalsize, off_struct, off_strings = struct.unpack_from(">IIII", raw, base)
+          dtb = raw[base:base + totalsize]
+          strs = dtb[off_strings:]
+          p = off_struct
+          cur = []
+          nodes = []
+          props = {}
+          while p < len(dtb):
+              tok = struct.unpack_from(">I", dtb, p)[0]
+              p += 4
+              if tok == 1:
+                  e = dtb.index(b"\0", p)
+                  name = dtb[p:e].decode("utf-8", "replace")
+                  p = (e + 4) & ~3
+                  cur.append(name)
+                  nodes.append("/" + "/".join(cur))
+              elif tok == 2:
+                  if cur:
+                      cur.pop()
+              elif tok == 3:
+                  plen, nameoff = struct.unpack_from(">II", dtb, p)
+                  p += 8
+                  nm = strs[nameoff:strs.index(b"\0", nameoff)].decode("utf-8", "replace")
+                  props[("/" + "/".join(cur)) + "/" + nm] = dtb[p:p + plen]
+                  p += plen
+                  p = (p + 3) & ~3
+              elif tok == 9:
+                  break
+              else:
+                  break
+
+          for k in ("/model", "/compatible"):
+              if k in props:
+                  print("%s = %s" % (k, props[k].rstrip(b"\0").decode("utf-8", "replace")))
+
+          rm = sorted(n for n in nodes if n.startswith("//reserved-memory/") and n.count("/") == 3)
+          print("reserved-memory 区域 %d 个:" % len(rm))
+          for n in rm:
+              reg = props.get(n + "/reg", b"")
+              if len(reg) >= 16:
+                  a, s = struct.unpack(">QQ", reg[:16])
+                  print("  %-58s 0x%016x + 0x%x" % (n.split("/")[-1], a, s))
+              else:
+                  print("  %-58s (无 reg)" % n.split("/")[-1])
+
+          if not rm:
+              print("::error::内嵌 DTB 里没有 reserved-memory 区域 —— ATF/TEE/SCP/SSPM 的内存"
+                    " 会被内核当普通内存分配, DMA 踩页表后开机随机崩")
+              sys.exit(1)
+          PY
+
       - name: 编译内核模块
         if: ${{ (env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '') && (env.BUILD_MODULES == 'true' || env.REUSE_RUN_ID == '') }}
         run: |
@@ -575,20 +690,53 @@ jobs:
             "${ROOTFS_HOSTNAME:-xaga}" "${ROOTFS_PASSWORD:-root}" \
             "${WIFI_SSID:-}" "${WIFI_PASSWORD:-}" "${EXTRA_PKGS:-}" "${ARCH_DESKTOP:-kde}"
           sudo rm -f rootfs/tmp/xaga-setup.sh
-          sudo umount -R rootfs/dev || true
-          sudo umount -R rootfs/sys || true
-          sudo umount -R rootfs/proc || true
+          # === 修复: 可靠卸载伪文件系统 (原实现用 "|| true" 把失败吞掉, 导致 rsync 把宿主机
+          #     /sys /proc /dev 拷进 ext4 镜像 -> Permission denied / No data available -> 退出码 23) ===
+          # 1) 倒序卸载 (dev 是 --rbind, 含 dev/pts dev/shm 等多层挂载, 用 -R 递归)
+          for m in dev proc sys; do
+            sudo umount -R "rootfs/$m" 2>/dev/null || true
+          done
+          # 2) 卸载失败兜底: 可能有 chroot 残留进程占着挂载点, 重试几轮
+          for i in 1 2 3; do
+            if mount | grep -q "$PWD/rootfs"; then
+              echo "rootfs 下仍有挂载 (第 ${i} 次重试清理):"
+              mount | grep "$PWD/rootfs" || true
+              sleep 5
+              for m in dev proc sys; do
+                sudo umount -R "rootfs/$m" 2>/dev/null || true
+              done
+            else
+              break
+            fi
+          done
+          # 3) 最终断言: 还挂着就中止, 绝不带着挂载点进 rsync
+          if mount | grep -q "$PWD/rootfs"; then
+            echo "::error::rootfs 下伪文件系统未卸载干净 (umount 失败), 已中止"
+            echo "::error::可能原因: chroot 内有进程未退出。可手动排查: mount | grep rootfs"
+            mount | grep "$PWD/rootfs" || true
+            exit 1
+          fi
+          echo "伪文件系统已全部卸载, rootfs 可安全打包"
 
       - name: 生成 ext4 镜像并填充 rootfs
         run: |
           set -euo pipefail
           size="${IMG_SIZE:-6}"
           case "$size" in (*[!0-9]*) echo "::error::rootfs 容量必须是纯数字 (GB)"; exit 1 ;; esac
+          # === 修复: rsync 前再兜底检查一次, 防止上游步骤残留挂载 ===
+          if mount | grep -q "$PWD/rootfs"; then
+            echo "::error::rootfs 下仍有伪文件系统挂载, 拒绝打包"
+            mount | grep "$PWD/rootfs" || true
+            exit 1
+          fi
           sudo truncate -s "${size}G" "rootfs-${TS}.img"
           sudo mkfs.ext4 -F -L xaga-rootfs "rootfs-${TS}.img"
           mkdir -p mnt
           sudo mount -o loop "rootfs-${TS}.img" mnt
-          sudo rsync -aHAX --numeric-ids rootfs/ mnt/
+          # === 修复: 双保险, 就算有残留挂载也不把 /sys /proc /dev 内容拷进镜像 (保留空目录) ===
+          sudo rsync -aHAX --numeric-ids \
+            --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' \
+            rootfs/ mnt/
           # 刷入后首次开机 resize2fs 撑满 userdata: resize2fs /dev/sdc86
           sudo umount mnt
           sudo chown "$(id -u):$(id -g)" "rootfs-${TS}.img"
@@ -664,7 +812,7 @@ jobs:
             echo ""
             echo "刷写:"
             echo "  fastboot flash boot boot-<时间戳>.img"
-            echo "  fastboot flash rootfs rootfs-sparse-<时间戳>.img"
+            echo "  fastboot flash userdata rootfs-sparse-<时间戳>.img"
             echo "  fastboot reboot"
             echo "  首次开机后: resize2fs /dev/sdc86"
           } > BUILD-INFO.txt
@@ -725,7 +873,7 @@ jobs:
           \`\`\`bash
           # MTK v4 boot header 不支持 fastboot boot, 必须刷到对应槽位
           fastboot flash boot boot-<时间戳>.img
-          fastboot flash rootfs rootfs-sparse-<时间戳>.img
+          fastboot flash userdata rootfs-sparse-<时间戳>.img
           fastboot reboot
           \`\`\`
 
