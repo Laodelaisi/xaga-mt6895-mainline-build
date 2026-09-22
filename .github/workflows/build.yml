@@ -345,6 +345,17 @@ jobs:
           ARCH=arm64 scripts/kconfig/merge_config.sh \
             arch/arm64/configs/defconfig arch/arm64/configs/xaga.config
           make ARCH=arm64 LLVM=1 olddefconfig
+          # 防御断言: CONFIG_INITRAMFS_FORCE=y 会让内核直接跳过 boot.img 里的 initramfs
+          #   init/initramfs.c: if (!initrd_start || IS_ENABLED(CONFIG_INITRAMFS_FORCE)) goto done;
+          # 再叠加 CONFIG_CMDLINE_FORCE=y(没有 root=), 结果必然是 VFS panic -> 卡第一 logo 重启。
+          # 上游在 09-20 的 VCP merge 里误开过一次, 09-22 由 1bd83bb58a 修掉。
+          if grep -qx 'CONFIG_INITRAMFS_FORCE=y' .config; then
+            echo "::error::CONFIG_INITRAMFS_FORCE=y: 内核会忽略 boot.img 里的 initramfs, 刷上必卡 logo 重启"
+            echo "::error::换 6.18 分支, 或等上游把 xaga.config 改回来再编"
+            exit 1
+          fi
+          echo "initramfs / cmdline 相关配置:"
+          grep -E '^CONFIG_(BLK_DEV_INITRD|INITRAMFS_FORCE|CMDLINE|CMDLINE_FORCE)=' .config || true
           make ARCH=arm64 LLVM=1 -j"$(nproc --all)" Image
           gzip -n -9 -c arch/arm64/boot/Image > "../out/Image-${TS}.gz"
           ls -l "../out/Image-${TS}.gz"
