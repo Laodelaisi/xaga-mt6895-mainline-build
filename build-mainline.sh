@@ -1,569 +1,655 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  build-mainline.sh —— xaga (Redmi Note 11T Pro / MT6895 / 天玑8100)
-#                      主线内核一键编译 + boot.img 打包
+# build-mainline.sh —— xaga (Redmi Note 11T Pro / MT6895 / 天玑8100) 主线内核本地构建
 #
-#  本脚本按 postmarketOS wiki（Xiaomi Redmi Note 11T Pro (xiaomi-xaga)）的
-#  「Building」章节实现，并把 wiki 之外必须知道的东西全部写死在流程里：
+# 项目根目录 = 本脚本所在目录, 不硬编码任何绝对路径:
+#   ./linux/      内核源码 (已存在就不重新 clone)
+#   ./initramfs/  MT6895-Mainline/initramfs (已存在就不重新 clone)
+#   ./mktools/    mkbootimg 打包器 (没有就装到这里)
+#   ./out/        产物: boot-<ts>.img / Image-<ts>.gz / initramfs-<ts>.cpio.lz4 / modules-<ts>.tar.gz
+#   ./logs/       构建日志
 #
-#    https://wiki.postmarketos.org/wiki/Xiaomi_Redmi_Note_11T_Pro_(%2B)_/_POCO_X4_GT_/_Redmi_K50i_(xiaomi-xaga)
+# 不带任何参数直接跑 = 交互式问答, 每一项都对应 .github/workflows/build.yml 的
+# workflow_dispatch 输入 (下拉选序号 / 打勾输 y/n / 文本框直接回车用默认)。
 #
-#  ---------------------------------------------------------------------------
-#  产物（默认放在 $TOP/out/，**文件名一律带「编译完成时间」时间戳**）
-#    boot-<戳>.img             —— 直接 fastboot flash boot_a / boot_b 的镜像
-#    boot-<戳>.img.gz          —— 上面那个的 gzip 备份（收发/存档用；刷机用 .img）
-#    Image-<戳>.gz             —— 压缩后的内核（boot.img 里用的就是它）
-#    initramfs-<戳>.cpio.lz4   —— lz4 legacy 格式 ramdisk
-#    modules-<戳>.tar.gz       —— 内核模块（BUILD_MODULES=1 时；rootfs 的 /lib/modules）
-#    SHA256SUMS-<戳>.txt       —— 校验和
-#    build.log                 —— 完整编译日志
+# SSH 容易断的场景: 加 --tmux, 脚本会把自己丢进后台 tmux 会话, 断开也不中断,
+# 跑完调用 .github/bot-offline.py 推送通知 (喵提醒 / Server酱)。
 #
-#    时间戳格式 YYYYmmdd-HHMMSS，在**内核编完、开始打包那一刻**取，
-#    所以同一台机器反复构建不会互相覆盖。想固定名字就传 STAMP，例如
-#      STAMP=20260920-1046 ./build-mainline.sh
-#
-#  ---------------------------------------------------------------------------
-#  用法
-#    chmod +x build-mainline.sh
-#    ./build-mainline.sh                      # 全默认：编内核 + 打 boot.img + 编模块
-#    USB_GADGET=1 ./build-mainline.sh         # 默认就是 1：内建 USB 串口/RNDIS gadget
-#    USB_GADGET=0 ./build-mainline.sh         # 完全等价上游配置（不要 USB 调试）
-#    BUILD_MODULES=0 ./build-mainline.sh      # 不编模块（快 ~5-10 分钟）
-#    KERNEL_COMMIT=<sha> ./build-mainline.sh  # 固定到某个 commit（默认取分支 HEAD）
-#    MEM_LIMIT=6G ./build-mainline.sh         # 给 boot.img 追加 mem=6G（见下面 §cmdline）
-#    STAMP=20260920-1046 ./build-mainline.sh  # 指定产物时间戳（默认取编译完成时刻）
-#
-#  ---------------------------------------------------------------------------
-#  构建前置（Debian/Ubuntu/Armbian 系）
-#    clang >= 17.0.1 + lld + llvm-objcopy（DTB 是以 objcopy 链进 vmlinux 的，
-#    递归 make 里硬编码了 LLVM=1，所以 Clang 是硬性要求）
-#    aarch64-linux-gnu-gcc（编 initramfs 的 init.c）
-#    缺什么脚本会自己 apt-get（SKIP_APT=1 可跳过）
-#
-#  ---------------------------------------------------------------------------
-#  ★ 硬约束（都是从实测镜像/日志里抠出来的，别改）
-#
-#  1) BOOT_PARTITION 默认 /dev/sdc86 —— 这是 initramfs 的 init.c 里找 rootfs 用的
-#     设备节点，不是 fastboot 分区名。xaga 的 UFS 在主线内核里枚举成 scsi 盘：
-#        sd 0:0:0:0 -> sda(4MB)  sd 0:0:0:1 -> sdb(4MB)  sd 0:0:0:2 -> sdc(128GB)
-#     userdata 是 sdc 的第 86 号分区，所以是 /dev/sdc86。
-#     实测日志可证：`EXT4-fs (sdc86): mounted filesystem ...` 然后
-#     `CINIT: switch_root -> /sbin/init`。
-#     （网上/旧笔记里写的 /dev/mmcblk0p86 在这台机器这块内核上是错的，会找不到 root。）
-#  2) NVDATA_PARTITION 默认 /dev/sdc13 —— WiFi/BT 的 NVRAM 只读 ext4 分区，
-#     init.c 默认值就是这个，脚本用 EXTRA_CFLAGS 显式注入一次以防上游改默认值。
-#  3) rootfs 文件系统必须是 ext4（init.c 写死按 ext4 挂）。
-#  4) DTB 已被 objcopy 链进 vmlinux，mkbootimg **不要**再传 --dtb
-#     （`XAGA-DTB: overriding LK FDT with embedded mt6895-xiaomi-xaga.dtb`）。
-#  5) MTK v4 boot header 只认 base/kernel_offset/ramdisk_offset/tags_offset 齐全的镜像；
-#     而且设备**不支持 `fastboot boot`**，只能 flash 到 boot_a / boot_b。
-#  6) 本工程历史上只 `make Image`、从不 `make modules`，defconfig 里任何 `=m`
-#     都等于没编（那份镜像里有 1420 个 =m）。所以：
-#       - 要用的功能一律写 `=y`（本脚本的 USB gadget 片段就是这么干的）
-#       - 或者开 BUILD_MODULES=1 真的把模块编出来并塞进 rootfs
-#  7) 首次构建建议 USE_RUST=0：7.2 的 Rust 部分需要 rustc>=1.85 + bindgen>=0.71.1。
-#
-#  ---------------------------------------------------------------------------
-#  §cmdline 说明（重要，实测结论）
-#    xaga 的补丁会用内嵌 DTB 覆盖 LK 传进来的 FDT，生效的 `Kernel command line:`
-#    来自 DTB 的 /chosen/bootargs，**boot.img 里的 --cmdline 不会进内核**。
-#    实测启动日志：
-#      XAGA-CMDLINE: 8250.nr_uarts=4 console=tty0 printk.devkmsg=on log_buf_len=2M ...
-#      Kernel command line: 8250.nr_uarts=4 console=tty0 ... panic=15
-#      Memory: 5417384K/6291456K available     <- 6291456K = 6GiB，已经是 6G
-#    所以默认 CMDLINE=""（与当前能正常启动的镜像完全一致）。
-#    要是你确认需要（例如换成 8G 机器或 DTB 又改回 8GiB），用 MEM_LIMIT=6G
-#    追加一个 mem=6G 即可，加错也不会更糟。
-# =============================================================================
-set -Eeuo pipefail
+set -euo pipefail
 
-# ───────────────────────────── 配置区（环境变量可覆盖） ─────────────────────────────
-TOP="${TOP:-$HOME/xaga}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-KERNEL_REPO="${KERNEL_REPO:-https://github.com/MT6895-Mainline/linux}"
+# ===========================================================================
+# 宏定义 —— 与 .github/workflows/build.yml 的 workflow_dispatch 输入一一对应
+# 直接运行脚本会按下面的默认值逐条问答; 命令行参数 / 同名环境变量可覆盖
+# ===========================================================================
+
+ROOT="${XAGA_ROOT:-$SCRIPT_DIR}"          # 项目根目录 = 脚本所在目录
+
+# build.yml: kernel_branch (下拉 1/2)
 KERNEL_BRANCH="${KERNEL_BRANCH:-7.2-mt6895-xiaomi-xaga}"
-KERNEL_COMMIT="${KERNEL_COMMIT:-}"          # 留空 = 用分支 HEAD
+# build.yml: initramfs_userdata / initramfs_nvdata (文本框, xaga 硬事实, 别乱改)
+INITRAMFS_USERDATA="${INITRAMFS_USERDATA:-/dev/sdc86}"
+INITRAMFS_NVDATA="${INITRAMFS_NVDATA:-/dev/sdc13}"
+# build.yml: build_kernel / build_initramfs / build_modules (打勾 y/n)
+BUILD_KERNEL="${BUILD_KERNEL:-1}"
+BUILD_INITRAMFS="${BUILD_INITRAMFS:-1}"
+BUILD_MODULES="${BUILD_MODULES:-1}"
+# build.yml: reuse_run_id (文本框, 留空 = 复用本地 ./out 里最新产物)
+REUSE_RUN_ID="${REUSE_RUN_ID:-}"
+# build.yml: send_notification (打勾 y/n)
+NOTIFY="${NOTIFY:-1}"
 
-INITRAMFS_REPO="${INITRAMFS_REPO:-https://github.com/MT6895-Mainline/initramfs}"
-INITRAMFS_BRANCH="${INITRAMFS_BRANCH:-xaga-mt6895}"
-INITRAMFS_COMMIT="${INITRAMFS_COMMIT:-}"    # 留空 = 用分支 HEAD
+KERNEL_REPO="${KERNEL_REPO:-MT6895-Mainline/linux}"
+INITRAMFS_REPO="${INITRAMFS_REPO:-MT6895-Mainline/initramfs}"
+GH_REPO="${XAGA_GH_REPO:-}"              # 复用 RUNS ID 时的 OWNER/REPO
 
-BOOT_PARTITION="${BOOT_PARTITION:-/dev/sdc86}"     # xaga userdata（见硬约束 §1）
-NVDATA_PARTITION="${NVDATA_PARTITION:-/dev/sdc13}" # xaga nvdata（见硬约束 §2）
+LINUX_DIR="$ROOT/linux"
+INITRAMFS_DIR="$ROOT/initramfs"
+MKTOOLS_DIR="$ROOT/mktools"
+OUT_DIR="${OUT_DIR:-$ROOT/out}"
+LOG_DIR="$ROOT/logs"
 
-# ---- boot.img 头部参数（与 postmarketOS wiki / 已验证可启动镜像一致）----
-HEADER_VERSION="${HEADER_VERSION:-4}"
-PAGE_SIZE="${PAGE_SIZE:-4096}"
-BASE="${BASE:-0x3fff8000}"
-KERNEL_OFFSET="${KERNEL_OFFSET:-0x8000}"
-RAMDISK_OFFSET="${RAMDISK_OFFSET:-0x26f08000}"
-TAGS_OFFSET="${TAGS_OFFSET:-0x07c88000}"
-DTB_OFFSET="${DTB_OFFSET:-0x07c88000}"
-OS_VERSION="${OS_VERSION:-16.0.0}"
-OS_PATCH_LEVEL="${OS_PATCH_LEVEL:-2026-08}"
-MEM_LIMIT="${MEM_LIMIT:-}"                  # 见 §cmdline；默认空
-CMDLINE="${CMDLINE:-}"                      # 直接指定完整 cmdline（覆盖 MEM_LIMIT）
-STAMP="${STAMP:-}"                          # 产物时间戳（留空 = 内核编完打包时取当前时间）
+# boot 头部参数, 与 postmarketOS wiki 一致
+BASE=0x3fff8000
+KERNEL_OFFSET=0x8000
+PAGESIZE=4096
+RAMDISK_OFFSET=0x26f08000
+TAGS_OFFSET=0x07c88000
+DTB_OFFSET=0x07c88000
+HEADER_VERSION=4
+OS_VERSION=16.0.0
+OS_PATCH_LEVEL=2026-08
 
-# ---- 功能开关 ----
-USB_GADGET="${USB_GADGET:-1}"       # 1 = 合并 USB gadget 片段（=y，串口/RNDIS 调试）
-BUILD_MODULES="${BUILD_MODULES:-1}" # 1 = 额外编内核模块并打包 modules.tar.gz
-USE_RUST="${USE_RUST:-0}"           # 0 = 关 Rust（需要 rustc>=1.85）
-SKIP_APT="${SKIP_APT:-0}"           # 1 = 不自动装依赖
-JOBS="${JOBS:-$(nproc)}"
+UPDATE=0          # 1 = 强制 git fetch 更新已有源码
+DO_CLEAN=0        # 1 = 先 make clean
+USE_TMUX=0
+SESSION="xaga-build"
+JOBS="$(nproc 2>/dev/null || echo 4)"
+OUT_SET=0                    # 1 = 命令行显式给了 --out
+INTERACTIVE=0     # 1 = 走交互式问答
+MKBOOTIMG="${MKBOOTIMG:-}"   # 可用环境变量指定打包器
+REUSE_DIR=""      # 复用 RUNS ID 时, gh 下载下来的产物目录
 
-# 本仓库根目录（放 usb-debug/kernel-fragments 的那个）
-REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+TS="$(date +'%Y%m%d-%H%M%S')"
+LOG_FILE=""
+STATUS_FILE=""
 
-LINUX_DIR="$TOP/linux"
-INITRAMFS_DIR="$TOP/initramfs"
-TOOLS_DIR="$TOP/tools"
-OUT="$TOP/out"
+# --------------------------------------------------------------------------- 工具函数
 
-R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; N=$'\033[0m'
-step() { echo -e "\n${C}==>${N} ${G}$*${N}"; }
-warn() { echo -e "${Y}[warn]${N} $*"; }
-info() { echo -e "    $*"; }
-die()  { echo -e "${R}[fatal]${N} $*" >&2; exit 1; }
+log()  { printf '\033[1;32m[build]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[build][warn]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[build][error]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# ───────────────────────────── 1. 依赖 ─────────────────────────────
-if [[ "$SKIP_APT" != "1" ]]; then
-  step "安装构建依赖"
-  if command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq --no-install-recommends \
-      git bc bison flex libssl-dev libelf-dev libncurses-dev \
-      cpio lz4 zstd gzip xz-utils kmod rsync python3 python3-pip \
-      device-tree-compiler build-essential make \
-      gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-  else
-    warn "非 apt 系统，跳过自动装依赖（请自行确保 git/make/clang/lld/lz4/cpio 存在）"
-  fi
-fi
-
-# ───────────────────────────── 2. 定位 Clang (>=17.0.1) ─────────────────────────────
-step "检查 Clang / LLVM 工具链（最低 17.0.1）"
-clang_ver() { "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true; }
-ver_ge() { [[ "$(printf '%s\n%s' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
-
-CLANG_BIN=""
-for c in clang clang-21 clang-20 clang-19 clang-18 clang-17 \
-         /usr/lib/llvm-21/bin/clang /usr/lib/llvm-20/bin/clang \
-         /usr/lib/llvm-19/bin/clang /usr/lib/llvm-18/bin/clang \
-         /usr/lib/llvm-17/bin/clang; do
-  if command -v "$c" >/dev/null 2>&1 || [[ -x "$c" ]]; then
-    v="$(clang_ver "$c")"
-    if [[ -n "$v" ]] && ver_ge "$v" "17.0.1"; then
-      CLANG_BIN="$(command -v "$c" 2>/dev/null || echo "$c")"; break
-    fi
-  fi
-done
-
-if [[ -z "$CLANG_BIN" ]]; then
-  if command -v apt-get >/dev/null 2>&1 && [[ "$SKIP_APT" != "1" ]]; then
-    warn "未找到 >= 17.0.1 的 clang，用 apt.llvm.org 装 LLVM 18"
-    sudo apt-get install -y -qq lsb-release wget software-properties-common gnupg
-    wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh && chmod +x /tmp/llvm.sh
-    sudo /tmp/llvm.sh 18 all
-    CLANG_BIN="/usr/lib/llvm-18/bin/clang"
-  fi
-fi
-[[ -n "$CLANG_BIN" ]] || die "找不到 clang>=17.0.1，请手动安装 LLVM"
-
-LLVM_BIN_DIR="$(dirname "$CLANG_BIN")"
-export PATH="$LLVM_BIN_DIR:$PATH"
-info "clang : $CLANG_BIN ($(clang_ver "$CLANG_BIN"))"
-
-# LLVM=1 模式下 make 会去找不带版本后缀的工具名，缺一个就 build 不出来
-for tld in ld.lld llvm-objcopy llvm-ar llvm-nm llvm-strip llvm-readelf llvm-objdump; do
-  if ! command -v "$tld" >/dev/null 2>&1; then
-    # 尝试用带版本后缀的建软链
-    for v in 21 20 19 18 17; do
-      if [[ -x "$LLVM_BIN_DIR/$tld-$v" ]]; then
-        ln -sf "$LLVM_BIN_DIR/$tld-$v" "$LLVM_BIN_DIR/$tld"
-        break
-      fi
-    done
-  fi
-  command -v "$tld" >/dev/null 2>&1 || die "缺少 $tld（LLVM 工具链不完整，装 llvm / lld 包）"
-done
-info "LLVM 工具链齐全（ld.lld / llvm-objcopy 等）"
-
-export ARCH=arm64
-export LLVM=1
-# 注意：不要加 O= 出树构建 —— DTB 的递归 make 只在 srctree 里跑
-
-AARCH64_GCC="$(command -v aarch64-linux-gnu-gcc || true)"
-[[ -n "$AARCH64_GCC" ]] || die "缺少 aarch64-linux-gnu-gcc（编 initramfs 的 init.c 必需）"
-
-# ───────────────────────────── 3. 准备 mkbootimg ─────────────────────────────
-step "准备 mkbootimg 打包工具"
-MKBOOTIMG=""
-if command -v mkbootimg >/dev/null 2>&1; then
-  MKBOOTIMG="$(command -v mkbootimg)"
-  info "使用系统已安装的 mkbootimg: $MKBOOTIMG"
-else
-  mkdir -p "$TOP"
-  if [[ ! -d "$TOOLS_DIR/.git" ]]; then
-    info "克隆 osm0sis/mkbootimg（C 实现，支持 --os_version / --header_version）"
-    git clone --depth=1 https://github.com/osm0sis/mkbootimg.git "$TOOLS_DIR" || rm -rf "$TOOLS_DIR"
-  fi
-  if [[ -d "$TOOLS_DIR" ]]; then
-    # 新版 GCC 会把若干旧警告升级成错误，去掉 -Werror
-    sed -i 's/-Werror//g' "$TOOLS_DIR/Makefile" 2>/dev/null || true
-    sed -i 's/-Werror//g' "$TOOLS_DIR/libmincrypt/Makefile" 2>/dev/null || true
-    if make -C "$TOOLS_DIR" -j"$JOBS" >/dev/null 2>&1 && [[ -x "$TOOLS_DIR/mkbootimg" ]]; then
-      MKBOOTIMG="$TOOLS_DIR/mkbootimg"
-      info "自编译 mkbootimg 成功: $MKBOOTIMG"
-    fi
-  fi
-  if [[ -z "$MKBOOTIMG" ]]; then
-    warn "C 版 mkbootimg 不可用，退回 AOSP 官方 python 版"
-    [[ -d "$TOOLS_DIR/.git" ]] || git clone --depth=1 \
-      https://android.googlesource.com/platform/system/tools/mkbootimg "$TOOLS_DIR"
-    [[ -f "$TOOLS_DIR/mkbootimg.py" ]] || die "mkbootimg.py 也不可用"
-    MKBOOTIMG="python3 $TOOLS_DIR/mkbootimg.py"
-    info "使用 $MKBOOTIMG"
-  fi
-fi
-
-# ───────────────────────────── 4. 拉代码 ─────────────────────────────
-step "拉取源码"
-mkdir -p "$TOP"
-
-clone_or_update() {  # $1=url $2=branch $3=dir
-  local url="$1" br="$2" dir="$3" i
-  if [[ -d "$dir/.git" ]]; then
-    info "$(basename "$dir") 已存在，fetch 更新"
-    git -C "$dir" fetch --depth=1 origin "$br" -q || warn "fetch 失败，用本地已有的"
-  else
-    for i in 1 2 3; do
-      git clone --depth=1 -b "$br" "$url" "$dir" && break
-      warn "第 $i 次克隆失败，重试…"; rm -rf "$dir"; sleep 10
-    done
-  fi
-  [[ -d "$dir/.git" ]] || die "拉取失败: $url ($br)"
+# 各种"真"的写法统一成 1/0
+to_bool() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|y|yes|true|on)  echo 1 ;;
+        *)                echo 0 ;;
+    esac
 }
 
-clone_or_update "$KERNEL_REPO"    "$KERNEL_BRANCH"    "$LINUX_DIR"
-clone_or_update "$INITRAMFS_REPO" "$INITRAMFS_BRANCH" "$INITRAMFS_DIR"
+find_bot() {
+    local c
+    for c in "$ROOT/.github/bot-offline.py" "$ROOT/bot-offline.py"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    echo ""
+}
 
-if [[ -n "$KERNEL_COMMIT" ]]; then
-  info "内核固定到 commit: $KERNEL_COMMIT"
-  git -C "$LINUX_DIR" fetch --depth=1 origin "$KERNEL_COMMIT" -q || true
-  git -C "$LINUX_DIR" checkout -q "$KERNEL_COMMIT" || die "内核 checkout $KERNEL_COMMIT 失败"
-fi
-if [[ -n "$INITRAMFS_COMMIT" ]]; then
-  info "initramfs 固定到 commit: $INITRAMFS_COMMIT"
-  git -C "$INITRAMFS_DIR" fetch --depth=1 origin "$INITRAMFS_COMMIT" -q || true
-  git -C "$INITRAMFS_DIR" checkout -q "$INITRAMFS_COMMIT" || die "initramfs checkout 失败"
-fi
+BOT="$(find_bot)"
 
-KVER_STR="$(git -C "$LINUX_DIR" rev-parse --short HEAD)"
-info "内核      : $KERNEL_BRANCH @ $KVER_STR  ($(git -C "$LINUX_DIR" log -1 --format='%s'))"
-info "initramfs : $INITRAMFS_BRANCH @ $(git -C "$INITRAMFS_DIR" rev-parse --short HEAD)"
+notify() {
+    local status="$1"; shift
+    local msg="$*"
+    [ "$NOTIFY" = "1" ] || { log "(通知已关闭)"; return 0; }
+    if [ -z "$BOT" ]; then
+        warn "找不到 bot-offline.py, 跳过通知"
+        return 0
+    fi
+    local -a extra=()
+    [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ] && extra=(--log "$LOG_FILE")
+    python3 "$BOT" --notify --status "$status" --message "$msg" \
+        ${extra[@]+"${extra[@]}"} || warn "通知发送失败 (不影响构建结果)"
+}
 
-# ───────────────────────────── 5. 构建 initramfs ─────────────────────────────
-# init.c 做三件事：挂 nvdata 取 WiFi/BT NVRAM 与固件 → 镜像进 rootfs 与 initramfs
-#                   → pivot_root 到 BOOT_PARTITION 并 exec /sbin/init
-step "构建 initramfs (BOOT_PARTITION=$BOOT_PARTITION, NVDATA=$NVDATA_PARTITION)"
-make -C "$INITRAMFS_DIR" clean >/dev/null 2>&1 || true
+on_err() {
+    local line="$1" rc="$2"
+    printf '\033[1;31m[build][error]\033[0m 第 %s 行失败 (exit=%s)\n' "$line" "$rc" >&2
+    [ -n "$STATUS_FILE" ] && echo "failure" > "$STATUS_FILE"
+    notify failure "构建失败: 第 $line 行 (exit=$rc)${LOG_FILE:+  日志: $LOG_FILE}"
+    exit "$rc"
+}
+trap 'on_err $LINENO $?' ERR
 
-# 上游 Makefile 只注入 BOOT_PARTITION；NVDATA_PARTITION 是 init.c 里的 #ifndef 默认宏。
-# 这里给 Makefile 的 CFLAGS 前面挂一个 EXTRA_CFLAGS 钩子（不改上游逻辑），
-# 把 nvdata 路径显式传进去，避免上游以后改默认值把 xaga 弄坏。
-if grep -q '^CFLAGS := ' "$INITRAMFS_DIR/Makefile" \
-   && ! grep -q 'EXTRA_CFLAGS' "$INITRAMFS_DIR/Makefile"; then
-  sed -i 's|^CFLAGS := |CFLAGS := $(EXTRA_CFLAGS) |' "$INITRAMFS_DIR/Makefile"
-fi
+usage() {
+    cat <<EOF
+用法: $0 [选项]
 
-# ⚠️ 不要写 `make initramfs.cpio` —— 该 Makefile 的目标是**绝对路径**
-#    TMP_CPIO := $(CURDIR)/initramfs.cpio，make 匹配不到相对名字。
-#    直接跑默认目标 all（= initramfs.cpio.lz4），它先生成 cpio 再 lz4。
-make -C "$INITRAMFS_DIR" \
-     CROSS=aarch64-linux-gnu- \
-     BOOT_PARTITION="$BOOT_PARTITION" \
-     EXTRA_CFLAGS="-DNVDATA_PARTITION=\\\"$NVDATA_PARTITION\\\""
+不带任何参数直接运行 = 交互式问答 (对应 build.yml 的 workflow_dispatch 参数)。
 
-INITRAMFS_LZ4="$INITRAMFS_DIR/initramfs.cpio.lz4"
-[[ -f "$INITRAMFS_LZ4" ]] || die "initramfs.cpio.lz4 未生成"
+  -i, --interactive  强制走交互式问答
+  --root DIR         项目根目录 (默认: 脚本所在目录 $ROOT)
+  --branch NAME      内核分支 (默认 $KERNEL_BRANCH)
+  --userdata DEV     initramfs 的 userdata 设备 (默认 $INITRAMFS_USERDATA)
+  --nvdata DEV       initramfs 的 NVRAM 分区 (默认 $INITRAMFS_NVDATA)
+  --no-kernel        不编内核, 复用 Image-*.gz
+  --no-initramfs     不编 initramfs, 复用 initramfs-*.cpio.lz4
+  --no-modules       不编内核模块, 复用 modules-*.tar.gz
+  --reuse-run-id ID  复用 GitHub Actions 某次 Run 的产物 (留空=复用本地 ./out)
+  --repo OWNER/REPO  配合 --reuse-run-id, gh 要的仓库 (默认读环境变量 XAGA_GH_REPO)
+  --update           强制 fetch 更新已存在的 linux/ 和 initramfs/
+  --clean            编译前先 clean
+  -j N               并行数 (默认 nproc)
+  --out DIR          产物目录 (默认 $OUT_DIR)
+  --tmux             丢进后台 tmux 会话, SSH 断了也不中断
+  --session NAME     tmux 会话名 (默认 $SESSION)
+  --no-notify        构建完不发通知
+  -h, --help         看这个
 
-# lz4 -l 产出 legacy 格式，正好匹配原厂 boot.img 的 RAMDISK_FMT=lz4_legacy
-info "initramfs.cpio     : $(du -h "$INITRAMFS_DIR/initramfs.cpio" | cut -f1)"
-info "initramfs.cpio.lz4 : $(du -h "$INITRAMFS_LZ4" | cut -f1)"
-info "init.c 里写死的分区路径（应含 $BOOT_PARTITION 与 $NVDATA_PARTITION）："
-strings "$INITRAMFS_DIR/root/init" 2>/dev/null | grep -E '^/dev/' | sort -u | sed 's/^/      /' || true
+头部参数硬编码为 postmarketOS wiki 的值, 不提供命令行修改 (别乱改)。
+EOF
+}
 
-# ───────────────────────────── 6. 生成 .config ─────────────────────────────
-step "生成 .config（defconfig + xaga.config[ + USB gadget 片段]）"
-cd "$LINUX_DIR"
-[[ -f arch/arm64/configs/defconfig   ]] || die "缺少 arch/arm64/configs/defconfig"
-[[ -f arch/arm64/configs/xaga.config ]] || die "缺少 arch/arm64/configs/xaga.config（分支选错了？）"
+# --------------------------------------------------------------------------- 交互式问答
 
-MERGE_LIST=(arch/arm64/configs/defconfig arch/arm64/configs/xaga.config)
+# 打勾选项: y/n, 直接回车用默认
+ask_bool() {
+    local prompt="$1" def="$2" ans hint
+    if [ "$def" = "1" ]; then hint="Y/n"; else hint="y/N"; fi
+    read -r -p "  $prompt [$hint]: " ans || true
+    ans="$(printf '%s' "$ans" | tr -d '[:space:]')"
+    case "$ans" in
+        "")                 echo "$def" ;;
+        y|Y|yes|YES|1|on)   echo 1 ;;
+        n|N|no|NO|0|off)    echo 0 ;;
+        *)  echo "$def" ;;
+    esac
+}
 
-GADGET_FRAG="$REPO_ROOT/usb-debug/kernel-fragments/xaga-usb-gadget.config"
-if [[ "$USB_GADGET" == "1" ]]; then
-  [[ -f "$GADGET_FRAG" ]] || die "USB_GADGET=1 但找不到 $GADGET_FRAG"
-  # merge_config.sh 后写的覆盖先写的，所以 fragment 放最后，不必去 fork 内核仓库改 xaga.config
-  MERGE_LIST+=("$GADGET_FRAG")
-  info "追加 gadget 片段: $GADGET_FRAG"
-fi
+# 文本框: 直接回车用默认
+ask_str() {
+    local prompt="$1" def="$2" ans
+    if [ -z "$def" ]; then
+        read -r -p "  $prompt [默认: 空]: " ans || true
+    else
+        read -r -p "  $prompt [默认: $def]: " ans || true
+    fi
+    if [ -z "$ans" ]; then printf '%s' "$def"; else printf '%s' "$ans"; fi
+}
 
-ARCH=arm64 scripts/kconfig/merge_config.sh -m "${MERGE_LIST[@]}"
+# 下拉选择: 输入序号 (选项写成 "值|显示文本", 没有 | 就显示值本身)
+ask_choice() {
+    local prompt="$1" def="$2"; shift 2
+    local -a opts=("$@")
+    local i entry val disp ans n="${#opts[@]}"
+    # 菜单走 stderr: 调用方是 $(ask_choice ...), 只有最后那个值走 stdout
+    printf '  %s\n' "$prompt" >&2
+    for i in "${!opts[@]}"; do
+        entry="${opts[$i]}"
+        val="${entry%%|*}"
+        disp="${entry#*|}"
+        [ "$disp" != "$entry" ] || disp="$val"
+        printf '    %d) %s%s\n' "$((i+1))" "$disp" \
+            "$( [ "$((i+1))" = "$def" ] && echo '   <默认>' || true )" >&2
+    done
+    printf '  请输入序号 [默认 %s]: ' "$def" >&2
+    read -r ans || true
+    [ -n "$ans" ] || ans="$def"
+    case "$ans" in
+        ''|*[!0-9]*) warn "'$ans' 不是序号, 用默认 $def"; ans="$def" ;;
+    esac
+    if [ "$ans" -lt 1 ] || [ "$ans" -gt "$n" ]; then
+        warn "序号 $ans 超出范围, 用默认 $def"; ans="$def"
+    fi
+    printf '%s' "${opts[$((ans-1))]%%|*}"
+}
 
-if [[ "$USE_RUST" != "1" ]]; then
-  warn "关闭 Rust（CONFIG_RUST=n；panic 画面改用 kmsg）"
-  scripts/config --disable CONFIG_RUST
-  scripts/config --disable CONFIG_DRM_PANIC_SCREEN_QR_CODE
-  scripts/config --set-str CONFIG_DRM_PANIC_SCREEN "kmsg"
-fi
+# 对应 build.yml 的 workflow_dispatch 输入, 逐条问答
+interactive_config() {
+    cat <<EOF
 
-# 避免新版 clang 把驱动警告升级成错误（上游树警告不少）
-scripts/config --disable CONFIG_WERROR
+================ xaga 主线内核构建 (本地) ================
+直接回车 = 用默认值; 打勾项输 y/n; 下拉项输序号。
+项目根目录: $ROOT
+==========================================================
+EOF
+    echo "[1/8] kernel_branch —— 内核分支"
+    KERNEL_BRANCH="$(ask_choice "选择内核分支" 1 \
+        '7.2-mt6895-xiaomi-xaga|7.2 功能最新' \
+        '6.18-mt6895-xiaomi-xaga|6.18 更保守')"
 
-# 关掉与 xaga(MT6895) 无关的联发科 ASoC 驱动：
-# mt8183-afe-pcm.c 自带的 MTK_AFE_RATE_8K 与 common/mtk-base-afe.h 里的同名枚举
-# 取值不同，clang 直接判定 redefinition 编挂。这些 SoC 都是 Chromebook/电视盒，
-# xaga 用不到，关掉即可（顺带省编译时间）。
-warn "关闭无关联发科 ASoC 驱动（只保留 MT6895）"
-scripts/config \
-  --disable CONFIG_SND_SOC_MT8183 \
-  --disable CONFIG_SND_SOC_MT8183_MT6358_TS3A227E_MAX98357A \
-  --disable CONFIG_SND_SOC_MT8183_DA7219_MAX98357A \
-  --disable CONFIG_SND_SOC_MT8188 \
-  --disable CONFIG_SND_SOC_MT8188_MT6359 \
-  --disable CONFIG_SND_SOC_MT8192 \
-  --disable CONFIG_SND_SOC_MT8192_MT6359_RT1015_RT5682 \
-  --disable CONFIG_SND_SOC_MT8195 \
-  --disable CONFIG_SND_SOC_MT8195_MT6359 \
-  --disable CONFIG_SND_SOC_MT8365 \
-  --disable CONFIG_SND_SOC_MT8365_MT6357 \
-  --disable CONFIG_SND_SOC_SOF_MT8186 \
-  --disable CONFIG_SND_SOC_SOF_MT8195
+    echo "[2/8] initramfs_userdata —— initramfs 找 rootfs 的设备节点"
+    INITRAMFS_USERDATA="$(ask_str "userdata 设备节点 (xaga = /dev/sdc86, 不是 fastboot 分区名)" "$INITRAMFS_USERDATA")"
 
-make ARCH=arm64 LLVM=1 olddefconfig >/dev/null
+    echo "[3/8] initramfs_nvdata —— WiFi/BT NVRAM 分区"
+    INITRAMFS_NVDATA="$(ask_str "NVRAM 分区 (xaga = /dev/sdc13)" "$INITRAMFS_NVDATA")"
 
-# 关于日志里那句 `systemd-modules-load: Failed to find module 'crypto_user'`：
-# CONFIG_CRYPTO_USER 本来就已经 =y（已内建），这句报错的真正原因是 rootfs 里有
-# modules-load.d 的 drop-in 在开机时 modprobe crypto_user —— 内建的东西没有 .ko 文件，
-# modprobe 自然找不到。修法在 rootfs 侧（删掉那条 drop-in），见 build-rootfs.sh。
+    echo "[4/8] build_kernel —— 是否编译内核"
+    BUILD_KERNEL="$(ask_bool "编译内核?" "$BUILD_KERNEL")"
 
-step "校验关键配置"
-grep -q '^CONFIG_OF=y'           .config || die "CONFIG_OF 必须为 y —— DTB 嵌入依赖它"
-grep -q '^CONFIG_BLK_DEV_INITRD=y' .config || die "CONFIG_BLK_DEV_INITRD 必须为 y"
-for k in CONFIG_OF CONFIG_BLK_DEV_INITRD CONFIG_RD_LZ4 CONFIG_CONFIGFS_FS CONFIG_MODULES CONFIG_IKCONFIG CONFIG_CRYPTO_USER; do
-  printf '      %-28s %s\n' "$k" "$(grep -m1 "^${k}=" .config || echo '(unset)')"
+    echo "[5/8] build_initramfs —— 是否编译 initramfs"
+    BUILD_INITRAMFS="$(ask_bool "编译 initramfs?" "$BUILD_INITRAMFS")"
+
+    echo "[6/8] build_modules —— 是否编译内核模块"
+    BUILD_MODULES="$(ask_bool "编译内核模块?" "$BUILD_MODULES")"
+
+    echo "[7/8] reuse_run_id —— 复用产物来源"
+    REUSE_RUN_ID="$(ask_str "GitHub Actions RUNS ID (留空=复用本地 ./out 最新产物)" "$REUSE_RUN_ID")"
+
+    echo "[8/8] send_notification —— 构建完推送通知"
+    NOTIFY="$(ask_bool "构建完推送通知 (喵提醒/Server酱)?" "$NOTIFY")"
+
+    echo
+    echo "  --- 本地附加项 ---"
+    USE_TMUX="$(ask_bool "丢进后台 tmux 会话 (SSH 断线也不中断)?" "$USE_TMUX")"
+    JOBS="$(ask_str "并行编译数 -j" "$JOBS")"
+    UPDATE="$(ask_bool "强制 git fetch 更新 linux/ 和 initramfs/?" "$UPDATE")"
+
+    echo
+    log "汇总: 分支=$KERNEL_BRANCH userdata=$INITRAMFS_USERDATA nvdata=$INITRAMFS_NVDATA"
+    log "      内核=$BUILD_KERNEL initramfs=$BUILD_INITRAMFS modules=$BUILD_MODULES"
+    log "      复用RUNS ID=${REUSE_RUN_ID:-<留空, 用本地 out/>} 通知=$NOTIFY tmux=$USE_TMUX -j$JOBS"
+}
+
+# --------------------------------------------------------------------------- 参数解析
+
+ARGC=$#
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -i|--interactive) INTERACTIVE=1; shift ;;
+        --root)         ROOT="$2"; shift 2 ;;
+        --branch)       KERNEL_BRANCH="$2"; shift 2 ;;
+        --userdata|--boot-part) INITRAMFS_USERDATA="$2"; shift 2 ;;
+        --nvdata)       INITRAMFS_NVDATA="$2"; shift 2 ;;
+        --no-kernel)    BUILD_KERNEL=0; shift ;;
+        --no-initramfs) BUILD_INITRAMFS=0; shift ;;
+        --no-modules)   BUILD_MODULES=0; shift ;;
+        --reuse-run-id) REUSE_RUN_ID="$2"; shift 2 ;;
+        --repo)         GH_REPO="$2"; shift 2 ;;
+        --update)       UPDATE=1; shift ;;
+        --clean)        DO_CLEAN=1; shift ;;
+        -j)             JOBS="$2"; shift 2 ;;
+        --out)          OUT_DIR="$2"; OUT_SET=1; shift 2 ;;
+        --tmux)         USE_TMUX=1; shift ;;
+        --session)      SESSION="$2"; shift 2 ;;
+        --no-notify)    NOTIFY=0; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              die "未知参数: $1 (试试 $0 --help)" ;;
+    esac
 done
 
-if [[ "$USB_GADGET" == "1" ]]; then
-  # 硬断言：宁可构建失败，也不要再产出一个「插上 PC 没反应」的 boot.img
-  for k in CONFIG_USB_GADGET CONFIG_USB_LIBCOMPOSITE CONFIG_USB_CONFIGFS \
-           CONFIG_USB_U_SERIAL CONFIG_USB_F_ACM CONFIG_USB_CONFIGFS_ACM \
-           CONFIG_CONFIGFS_FS; do
-    if ! grep -qx "^${k}=y" .config; then
-      die "USB gadget 断言失败：${k} 不是 y（当前: $(grep -m1 "^${k}=" .config || echo unset)）"
-    fi
-  done
-  grep -qx '^# CONFIG_USB_G_SERIAL is not set' .config \
-    || warn "legacy CONFIG_USB_G_SERIAL 未被显式关闭（它会在 probe 时抢占 UDC，configfs 就绑不上）"
-  info "USB gadget 配置断言通过（全部 =y，走 configfs）"
+# 布尔量归一化 (环境变量可能给 true / false / yes ...)
+BUILD_KERNEL="$(to_bool "$BUILD_KERNEL")"
+BUILD_INITRAMFS="$(to_bool "$BUILD_INITRAMFS")"
+BUILD_MODULES="$(to_bool "$BUILD_MODULES")"
+NOTIFY="$(to_bool "$NOTIFY")"
+
+# 一个参数都没给 且 是终端 -> 走交互式问答
+if [ "$INTERACTIVE" = "1" ] || { [ "$ARGC" = "0" ] && [ -t 0 ]; }; then
+    interactive_config
 fi
 
-# ───────────────────────────── 7. 编译内核 ─────────────────────────────
-step "编译内核 Image（-j$JOBS，全 LLVM）"
-LOG="$TOP/build.log"
-make -j"$JOBS" ARCH=arm64 LLVM=1 Image 2>&1 | tee "$LOG"
+# --root 可能改了根目录, 这些路径必须重新算 (没显式给 --out 就跟着 ROOT 走)
+LINUX_DIR="$ROOT/linux"
+INITRAMFS_DIR="$ROOT/initramfs"
+MKTOOLS_DIR="$ROOT/mktools"
+LOG_DIR="$ROOT/logs"
+[ "$OUT_SET" = "1" ] || OUT_DIR="$ROOT/out"
+BOT="$(find_bot)"
 
-IMAGE="$LINUX_DIR/arch/arm64/boot/Image"
-DTB="$LINUX_DIR/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb"
-[[ -f "$IMAGE" ]] || die "Image 未生成，检查 $LOG"
+# initramfs 的 make 参数名沿用上游 Makefile
+BOOT_PARTITION="$INITRAMFS_USERDATA"
+NVDATA_PARTITION="$INITRAMFS_NVDATA"
 
-# dtb 规则可能因为已被链入 vmlinux 而跳过，这里补一次构建（失败不致命）
-if [[ ! -f "$DTB" ]]; then
-  make -j"$JOBS" ARCH=arm64 LLVM=1 \
-    arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb >>"$LOG" 2>&1 || true
-fi
+mkdir -p "$OUT_DIR" "$LOG_DIR"
 
-step "校验 DTB 已嵌入 vmlinux（开机能不能挂全看这个）"
-if nm "$LINUX_DIR/vmlinux" 2>/dev/null | grep -q mt6895_xiaomi_xaga_dtb_start; then
-  info "${G}OK${N}: 找到 _binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_xaga_dtb_start"
-else
-  die "DTB 未链入 vmlinux —— 刷上去必挂。检查 clang 是否在 PATH 且 >= 17.0.1"
-fi
-info "Image : $(du -h "$IMAGE" | cut -f1)"
-[[ -f "$DTB" ]] && info "DTB   : $(du -h "$DTB" | cut -f1)（已内嵌，打包时不要再传 --dtb）"
+# --------------------------------------------------------------------------- tmux: 断开 SSH 也不中断
 
-# ───────────────────────────── 8. 打包 boot.img ─────────────────────────────
-# 走到这里内核已经编完 —— 就用此刻作为「编译完成时间」给所有产物命名。
-# 同一台机器反复构建不再互相覆盖；想固定名字传 STAMP=YYYYmmdd-HHMMSS。
-STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
-BOOT_IMG="$OUT/boot-${STAMP}.img"
-BOOT_IMG_GZ="${BOOT_IMG}.gz"
-IMAGE_OUT="$OUT/Image-${STAMP}"
-IMAGE_OUT_GZ="${IMAGE_OUT}.gz"
-INITRAMFS_OUT="$OUT/initramfs-${STAMP}.cpio.lz4"
-INITRAMFS_CPIO_OUT="$OUT/initramfs-${STAMP}.cpio"
-MODULES_OUT="$OUT/modules-${STAMP}.tar.gz"
-SUMS_OUT="$OUT/SHA256SUMS-${STAMP}.txt"
-
-step "打包 boot.img（时间戳 $STAMP）"
-mkdir -p "$OUT"
-cp -f "$IMAGE" "$IMAGE_OUT"
-gzip -n -9 -c "$IMAGE" > "$IMAGE_OUT_GZ"     # -n 不写时间戳，保证可复现
-cp -f "$INITRAMFS_LZ4"          "$INITRAMFS_OUT"
-cp -f "$INITRAMFS_DIR/initramfs.cpio" "$INITRAMFS_CPIO_OUT"  # 给 magiskboot repack 用
-
-FINAL_CMDLINE="$CMDLINE"
-if [[ -z "$FINAL_CMDLINE" && -n "$MEM_LIMIT" ]]; then
-  FINAL_CMDLINE="mem=$MEM_LIMIT"
-fi
-
-MK_ARGS=(
-  --kernel          "$IMAGE_OUT_GZ"
-  --ramdisk         "$INITRAMFS_OUT"
-  --base             "$BASE"
-  --kernel_offset    "$KERNEL_OFFSET"
-  --pagesize         "$PAGE_SIZE"
-  --ramdisk_offset   "$RAMDISK_OFFSET"
-  --tags_offset      "$TAGS_OFFSET"
-  --dtb_offset       "$DTB_OFFSET"
-  --header_version   "$HEADER_VERSION"
-  --os_version       "$OS_VERSION"
-  --os_patch_level   "$OS_PATCH_LEVEL"
-  -o                 "$BOOT_IMG"
-)
-[[ -n "$FINAL_CMDLINE" ]] && MK_ARGS=(--cmdline "$FINAL_CMDLINE" "${MK_ARGS[@]}")
-
-info "mkbootimg ${MK_ARGS[*]}"
-# shellcheck disable=SC2086
-$MKBOOTIMG "${MK_ARGS[@]}"
-[[ -f "$BOOT_IMG" ]] || die "boot.img 未生成"
-
-step "校验 boot.img 头部（v4 必须 header_size=1584）"
-python3 - "$BOOT_IMG" <<'PY'
-import struct, sys
-p = sys.argv[1]
-d = open(p, 'rb').read(4096)
-magic = d[0x00:0x08]
-if magic != b'ANDROID!':
-    print('!! magic 异常:', magic); sys.exit(1)
-ksize = struct.unpack_from('<I', d, 0x08)[0]
-rsize = struct.unpack_from('<I', d, 0x0c)[0]
-osver = struct.unpack_from('<I', d, 0x10)[0]
-hsize = struct.unpack_from('<I', d, 0x14)[0]
-hver  = struct.unpack_from('<I', d, 0x28)[0]
-print(f'    magic          : {magic.decode()}')
-print(f'    kernel_size    : {ksize} ({ksize/1024/1024:.2f} MB)')
-print(f'    ramdisk_size   : {rsize} ({rsize/1024:.1f} KB)')
-print(f'    header_size    : {hsize}  (v4 应为 1584)')
-print(f'    header_version : {hver}')
-if hver != 4:  print(f'!! header_version 应为 4，实际 {hver}'); sys.exit(1)
-if hsize != 1584: print(f'!! header_size 应为 1584，实际 {hsize}'); sys.exit(1)
-if ksize == 0: print('!! kernel 段为空'); sys.exit(1)
-if rsize == 0: print('!! ramdisk 段为空'); sys.exit(1)
-print('    OK: boot.img 校验通过')
-PY
-
-# boot.img -> .gz：存档 / 发网盘 / 走 CI artifact 时省流量。刷机仍然用 .img 本体。
-step "压缩 boot.img -> $(basename "$BOOT_IMG_GZ")"
-gzip -n -9 -c "$BOOT_IMG" > "$BOOT_IMG_GZ"   # -n 不写时间戳；-c 保留原 .img 不动
-gzip -t "$BOOT_IMG_GZ" || die "boot.img.gz 回读校验失败（压缩写坏了）"
-info "$(basename "$BOOT_IMG")     : $(du -h "$BOOT_IMG" | cut -f1)"
-info "$(basename "$BOOT_IMG_GZ")  : $(du -h "$BOOT_IMG_GZ" | cut -f1)  （已过 gzip -t 回读校验）"
-
-# 从产物本身再抠一次内嵌 .config 复核，防止「改了 config 但编的不是那份」
-step "复核产物内嵌 config（IKCFG_ST…IKCFG_ED）"
-python3 - "$IMAGE_OUT" <<'PY' || warn "内嵌 config 复核失败（不影响刷机，只是少一道保险）"
-import gzip, io, re, sys
-raw = open(sys.argv[1], 'rb').read()
-s = raw.find(b'IKCFG_ST')
-e = raw.find(b'IKCFG_ED')
-if s < 0 or e < 0:
-    print('    IKCFG 标记不存在（CONFIG_IKCONFIG 未开？）'); sys.exit(0)
-blob = raw[s+8:e]
-cfg = None
-for off in range(0, 16):
-    try:
-        cfg = gzip.decompress(blob[off:]).decode('utf-8', 'replace'); break
-    except Exception:
-        continue
-if cfg is None:
-    print('    gzip 解压失败'); sys.exit(0)
-m = re.search(r'^Linux version .*$', raw.decode('utf-8', 'replace'), re.M)
-ver = m.group(0) if m else '(未找到版本串)'
-print('    ' + ver)
-for k in ('CONFIG_USB_CONFIGFS', 'CONFIG_USB_F_ACM', 'CONFIG_USB_U_SERIAL',
-          'CONFIG_USB_LIBCOMPOSITE', 'CONFIG_CRYPTO_USER'):
-    hit = re.search(rf'^{k}=.*$', cfg, re.M)
-    print(f'    {k:26s} {hit.group(0) if hit else "(unset)"}')
-PY
-
-step "计算校验和 -> $(basename "$SUMS_OUT")"
-(
-  cd "$OUT"
-  sha256sum \
-    "$(basename "$BOOT_IMG")" \
-    "$(basename "$BOOT_IMG_GZ")" \
-    "$(basename "$IMAGE_OUT_GZ")" \
-    "$(basename "$INITRAMFS_OUT")" > "$(basename "$SUMS_OUT")"
-  cat "$(basename "$SUMS_OUT")"
-)
-
-# ───────────────────────────── 9. 内核模块（可选但推荐） ─────────────────────────────
-# 放在 boot.img 之后：即使模块编不过，也不会毁掉已经产出的 boot.img。
-if [[ "$BUILD_MODULES" == "1" ]]; then
-  step "编译内核模块并打包 modules.tar.gz"
-  warn "本工程历史上从不编模块，defconfig 里 1420 个 =m 全是死的；这一步把它们真正编出来"
-  if make -j"$JOBS" ARCH=arm64 LLVM=1 modules >>"$LOG" 2>&1; then
-    rm -rf "$OUT/mods"
-    if make -j"$JOBS" ARCH=arm64 LLVM=1 \
-         modules_install INSTALL_MOD_PATH="$OUT/mods" INSTALL_MOD_STRIP=1 >>"$LOG" 2>&1; then
-      tar -czf "$MODULES_OUT" -C "$OUT/mods" lib
-      info "$(basename "$MODULES_OUT") : $(du -h "$MODULES_OUT" | cut -f1)"
-      info "模块数         : $(find "$OUT/mods/lib/modules" -name '*.ko*' | wc -l)"
-      info "内核版本目录   : $(ls "$OUT/mods/lib/modules")"
-      rm -rf "$OUT/mods"
+if [ "$USE_TMUX" = "1" ] && [ -z "${TMUX:-}" ] && [ -z "${XAGA_IN_TMUX:-}" ]; then
+    if ! command -v tmux >/dev/null 2>&1; then
+        warn "没装 tmux, 直接前台编译 (建议 apt-get install tmux)"
     else
-      warn "modules_install 失败，详见 $LOG"
+        LOG_FILE="$LOG_DIR/build-mainline-$TS.log"
+        STATUS_FILE="$LOG_DIR/build-mainline-$TS.status"
+        : > "$LOG_FILE"
+        # 去掉 --tmux 再交给会话里的自己 (并打上 XAGA_IN_TMUX 标记), 避免无限套娃
+        quoted="$(printf '%q ' --root "$ROOT" --branch "$KERNEL_BRANCH" \
+                  --userdata "$INITRAMFS_USERDATA" --nvdata "$INITRAMFS_NVDATA" \
+                  -j "$JOBS" --out "$OUT_DIR" --session "$SESSION")"
+        [ "$BUILD_KERNEL"    = 1 ] || quoted="$quoted --no-kernel"
+        [ "$BUILD_INITRAMFS" = 1 ] || quoted="$quoted --no-initramfs"
+        [ "$BUILD_MODULES"   = 1 ] || quoted="$quoted --no-modules"
+        [ -n "$REUSE_RUN_ID" ]    && quoted="$quoted --reuse-run-id $(printf '%q' "$REUSE_RUN_ID")"
+        [ -n "$GH_REPO" ]         && quoted="$quoted --repo $(printf '%q' "$GH_REPO")"
+        [ "$UPDATE"          = 1 ] &&  quoted="$quoted --update"
+        [ "$DO_CLEAN"        = 1 ] &&  quoted="$quoted --clean"
+        [ "$NOTIFY"          = 1 ] ||  quoted="$quoted --no-notify"
+
+        tmux new-session -d -s "$SESSION" \
+            "XAGA_IN_TMUX=1 XAGA_LOG_FILE=$(printf '%q' "$LOG_FILE") XAGA_STATUS_FILE=$(printf '%q' "$STATUS_FILE") bash $(printf '%q' "$0") $quoted 2>&1 | tee -a $(printf '%q' "$LOG_FILE")"
+        echo
+        log "已在后台 tmux 会话 '$SESSION' 开始构建, SSH 断开也不会中断"
+        log "  查看进度: tmux attach -t $SESSION   (Ctrl-b d 安全脱离)"
+        log "  日志文件: $LOG_FILE"
+        log "  盯完推送: python3 $( [ -n "$BOT" ] && echo "$BOT" || echo "$ROOT/.github/bot-offline.py" ) --watch-tmux $SESSION --log $LOG_FILE"
+        exit 0
     fi
-  else
-    warn "make modules 失败（不影响 boot.img）。详见 $LOG"
-  fi
 fi
 
-# ───────────────────────────── 10. 完成 ─────────────────────────────
-step "完成"
-ls -lh "$OUT"
+LOG_FILE="${XAGA_LOG_FILE:-$LOG_DIR/build-mainline-$TS.log}"
+STATUS_FILE="${XAGA_STATUS_FILE:-$LOG_DIR/build-mainline-$TS.status}"
+mkdir -p "$(dirname "$LOG_FILE")"
 
-cat <<EOF
+# --------------------------------------------------------------------------- 工具链检查
 
-${Y}产物（本次时间戳 $STAMP）${N}
-  $BOOT_IMG                 刷机用的镜像 ← 用这个
-  $BOOT_IMG_GZ              boot.img 的 gz（存档/传输；刷机前先 gunzip -k）
-  $IMAGE_OUT_GZ             内核（boot.img 里就是它）
-  $INITRAMFS_OUT            ramdisk
-  $MODULES_OUT              内核模块（BUILD_MODULES=1 时）
-  $SUMS_OUT                 校验和
-  $LOG                      完整编译日志
+check_toolchain() {
+    command -v clang >/dev/null 2>&1 \
+        || die "缺 clang (主线内核要求 clang>=17, LLVM=1 全链路)"
+    local v
+    v="$(clang --version | head -1 | grep -oE '[0-9]+' | head -1 || echo 0)"
+    [ "${v:-0}" -ge 17 ] || die "clang 版本太低: $v (要 >=17; README: Clang 18 全链路)"
+    command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 \
+        || die "缺 aarch64-linux-gnu-gcc (编 initramfs 的 init.c 要用)"
+    command -v ld.lld >/dev/null 2>&1 || warn "没找到 ld.lld, LLVM=1 链接可能失败"
+    command -v lz4 >/dev/null 2>&1 || warn "没找到 lz4 (initramfs 打包要用)"
+    log "工具链: clang $v / $(aarch64-linux-gnu-gcc --version | head -1)"
+}
 
-${Y}刷机（注意：MTK v4 头不支持 fastboot boot，只能写槽位）${N}
-  adb reboot bootloader
-  fastboot flash boot_a "$BOOT_IMG"          # 当前槽位；另一槽是 boot_b
-  fastboot flash userdata rootfs-*-sparse.img   # ⚠ 会清空手机内置存储
-  fastboot reboot
-  回滚: fastboot flash boot_a stock_boot.img
+# --------------------------------------------------------------------------- 源码: 有就不重复下载
 
-${Y}产物只留最新一份${N}
-  ls -t $OUT/boot-*.img | head -1
-  find $OUT -name 'boot-*.img' -o -name 'Image-*' -o -name 'initramfs-*' -o -name 'modules-*' | sort   # 想清理时先看
+ensure_kernel_src() {
+    if [ -d "$LINUX_DIR/.git" ]; then
+        log "内核源码已存在: $LINUX_DIR (不重复 clone)"
+        local cur
+        cur="$(git -C "$LINUX_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+        if [ "$cur" != "$KERNEL_BRANCH" ]; then
+            log "当前分支 '$cur' != 目标 '$KERNEL_BRANCH', 拉取目标分支"
+            git -C "$LINUX_DIR" fetch --depth 1 origin "$KERNEL_BRANCH"
+            git -C "$LINUX_DIR" checkout -f "$KERNEL_BRANCH"
+        elif [ "$UPDATE" = "1" ]; then
+            if [ -n "$(git -C "$LINUX_DIR" status --porcelain)" ]; then
+                warn "linux/ 有未提交改动, 跳过 fetch (要强制更新自己先处理)"
+            else
+                log "更新内核源码 ($KERNEL_BRANCH)"
+                git -C "$LINUX_DIR" fetch --depth 1 origin "$KERNEL_BRANCH"
+                git -C "$LINUX_DIR" reset --hard FETCH_HEAD
+            fi
+        fi
+    else
+        log "首次拉取内核源码: $KERNEL_REPO@$KERNEL_BRANCH"
+        git clone --depth 1 -b "$KERNEL_BRANCH" \
+            "https://github.com/$KERNEL_REPO.git" "$LINUX_DIR"
+    fi
+    log "内核 HEAD: $(git -C "$LINUX_DIR" log -1 --format='%h %s')"
+}
 
-${Y}开机后${N}
-  zcat /proc/config.gz | grep -E 'USB_CONFIGFS|USB_F_ACM'   # 复核 gadget 是否真的内建
-  xaga-usb-gadget --once                                    # 插上线后手工绑一次 UDC
-  systemctl status xaga-usb-gadget                          # 或用常驻服务（rootfs 里已铺）
+ensure_initramfs_src() {
+    if [ -d "$INITRAMFS_DIR/.git" ]; then
+        log "initramfs 源码已存在: $INITRAMFS_DIR (不重复 clone)"
+        if [ "$UPDATE" = "1" ]; then
+            if [ -n "$(git -C "$INITRAMFS_DIR" status --porcelain)" ]; then
+                warn "initramfs/ 有未提交改动, 跳过 pull"
+            else
+                git -C "$INITRAMFS_DIR" pull --ff-only
+            fi
+        fi
+    else
+        log "首次拉取 initramfs: $INITRAMFS_REPO"
+        local br ok=0
+        for br in main master; do
+            if git clone --depth 1 -b "$br" \
+                 "https://github.com/$INITRAMFS_REPO.git" "$INITRAMFS_DIR" 2>/dev/null; then
+                ok=1; break
+            fi
+        done
+        [ "$ok" = "1" ] || die "initramfs clone 失败 (main/master 都试过了)"
+    fi
+    log "initramfs HEAD: $(git -C "$INITRAMFS_DIR" log -1 --format='%h %s')"
+}
 
-${Y}排查${N}
-  echo 1 > /sys/devices/platform/soc@0/11201000.usb0/device_recover   # 上游给的 USB 复位开关
-  dmesg | grep -iE 'udc|gadget|mtu3'                                  # DRD 角色切换是否发生
-EOF
+# 打包器一律装在 ./mktools 下; 每个候选都先"真打一个最小包"验头部, 不是 1584 就换下一个
+MKTOOLS_AOSP_URL="https://android.googlesource.com/platform/system/tools/mkbootimg"
+MKTOOLS_OSM0SIS_URL="https://github.com/osm0sis/mkbootimg.git"
+
+# 冒烟: 打包器能不能产出合法 v4 头 (header_version=4 / header_size=1584)
+mkbootimg_smoke() {
+    local cmd="$1" tmpd out
+    tmpd="$(mktemp -d)"
+    : > "$tmpd/k"; : > "$tmpd/r"
+    out="$tmpd/boot.img"
+    if ! $cmd --kernel "$tmpd/k" --ramdisk "$tmpd/r" --pagesize 4096 \
+         --header_version 4 -o "$out" >"$tmpd/pack.log" 2>&1; then
+        warn "  打包器跑不通: $cmd ($(head -2 "$tmpd/pack.log" | tr '\n' ' '))"
+        rm -rf "$tmpd"; return 1
+    fi
+    if ! python3 - "$out" <<'PY'
+import struct, sys
+
+with open(sys.argv[1], "rb") as f:
+    h = f.read(1584)
+ok = (h[:8] == b"ANDROID!"
+      and struct.unpack_from("<I", h, 40)[0] == 4
+      and struct.unpack_from("<I", h, 20)[0] == 1584)
+sys.exit(0 if ok else 1)
+PY
+    then
+        warn "  产出的头不合法 (要 header_version=4 且 header_size=1584): $cmd"
+        rm -rf "$tmpd"; return 1
+    fi
+    rm -rf "$tmpd"
+    return 0
+}
+
+ensure_mktools() {
+    local -a cands=()
+    local cmd
+
+    # 1) 已经有的: 环境变量 / ./mktools/bin/mkbootimg / ./mktools/**/mkbootimg.py
+    [ -n "$MKBOOTIMG" ] && [ -x "$MKBOOTIMG" ] && cands+=("$MKBOOTIMG")
+    [ -x "$MKTOOLS_DIR/bin/mkbootimg" ] && cands+=("$MKTOOLS_DIR/bin/mkbootimg")
+    for cmd in "$MKTOOLS_DIR/mkbootimg.py" "$MKTOOLS_DIR/aosp/mkbootimg.py"; do
+        [ -f "$cmd" ] && cands+=("python3 $cmd")
+    done
+
+    # 2) ./mktools 里有 C 源码但没产物 -> 先 make (大概率是 v3, 1580, 冒烟会拦下)
+    if [ "${#cands[@]}" = "0" ] && [ -f "$MKTOOLS_DIR/Makefile" ]; then
+        log "./mktools 有源码没产物, 先 make"
+        make -C "$MKTOOLS_DIR" || warn "make 失败, 继续找别的打包器"
+        [ -x "$MKTOOLS_DIR/bin/mkbootimg" ] && cands+=("$MKTOOLS_DIR/bin/mkbootimg")
+    fi
+
+    # 3) 都没有 -> 拉 AOSP 官方 mkbootimg 装到 ./mktools/aosp
+    if [ "${#cands[@]}" = "0" ]; then
+        log "没有 mkbootimg, 安装 AOSP 官方版到 $MKTOOLS_DIR/aosp"
+        mkdir -p "$MKTOOLS_DIR"
+        git clone --depth 1 "$MKTOOLS_AOSP_URL" "$MKTOOLS_DIR/aosp" \
+            || die "AOSP mkbootimg 拉取失败 (网络?): $MKTOOLS_AOSP_URL"
+        # deb/源码里没打 gki 模块, 补个 stub 免得 import 炸
+        if [ ! -f "$MKTOOLS_DIR/aosp/gki.py" ]; then
+            cat > "$MKTOOLS_DIR/aosp/gki.py" <<'PY'
+def GenerateGkiCertificate(*args, **kwargs):
+    raise NotImplementedError("GKI 签名未实现 (xaga 用不到)")
+PY
+        fi
+        cands+=("python3 $MKTOOLS_DIR/aosp/mkbootimg.py")
+    fi
+
+    # 4) 逐个冒烟, 取第一个能产出合法 v4 头的
+    for cmd in "${cands[@]}"; do
+        log "校验打包器: $cmd"
+        if mkbootimg_smoke "$cmd"; then
+            MKBOOTIMG_CMD="$cmd"
+            log "打包器可用 (header_size=1584): $MKBOOTIMG_CMD"
+            return 0
+        fi
+    done
+
+    die "所有打包器都产不出合法的 v4 头 (header_size=1584)。
+  osm0sis 的 C 版 mkbootimg 只实现到 boot_img_hdr_v3 (恒 1580), MTK LK 会拒载。
+  手动装 AOSP 官方版:
+    git clone --depth 1 $MKTOOLS_AOSP_URL $MKTOOLS_DIR/aosp
+  或者 osm0sis 版 (仅作兜底): git clone $MKTOOLS_OSM0SIS_URL $MKTOOLS_DIR/osm0sis"
+}
+
+# --------------------------------------------------------------------------- 构建步骤
+
+build_initramfs() {
+    log "编译 initramfs (BOOT_PARTITION=$BOOT_PARTITION NVDATA_PARTITION=$NVDATA_PARTITION)"
+    cd "$INITRAMFS_DIR"
+    [ "$DO_CLEAN" = "1" ] && make clean
+    CROSS_COMPILE=aarch64-linux-gnu- \
+        make BOOT_PARTITION="$BOOT_PARTITION" NVDATA_PARTITION="$NVDATA_PARTITION"
+    cp -f "$INITRAMFS_DIR/initramfs.cpio.lz4" "$OUT_DIR/initramfs-$TS.cpio.lz4"
+    log "initramfs: $OUT_DIR/initramfs-$TS.cpio.lz4"
+    cd "$ROOT"
+}
+
+build_kernel() {
+    log "编译内核 (LLVM=1, -j$JOBS)"
+    cd "$LINUX_DIR"
+    if [ ! -f .config ] || [ "$DO_CLEAN" = "1" ]; then
+        ARCH=arm64 scripts/kconfig/merge_config.sh \
+            arch/arm64/configs/defconfig arch/arm64/configs/xaga.config
+        make ARCH=arm64 LLVM=1 olddefconfig
+    else
+        log "复用已有 .config (要重新 merge 就删掉 linux/.config 或加 --clean)"
+        make ARCH=arm64 LLVM=1 olddefconfig
+    fi
+    make ARCH=arm64 LLVM=1 -j"$JOBS" Image
+    gzip -n -9 -c arch/arm64/boot/Image > "$OUT_DIR/Image-$TS.gz"
+    log "内核 Image: $OUT_DIR/Image-$TS.gz"
+    cd "$ROOT"
+}
+
+build_modules() {
+    log "编译内核模块"
+    cd "$LINUX_DIR"
+    make ARCH=arm64 LLVM=1 -j"$JOBS" modules
+    rm -rf modout
+    make ARCH=arm64 LLVM=1 INSTALL_MOD_PATH="$PWD/modout" INSTALL_MOD_STRIP=1 modules_install
+    rm -f modout/lib/modules/*/build modout/lib/modules/*/source
+    tar -C modout -czf "$OUT_DIR/modules-$TS.tar.gz" lib
+    rm -rf modout
+    log "内核模块: $OUT_DIR/modules-$TS.tar.gz"
+    cd "$ROOT"
+}
+
+# build.yml: reuse_run_id —— 从 GitHub Actions 某次 Run 里把产物下下来再复用
+ensure_reuse_run() {
+    [ -n "$REUSE_RUN_ID" ] || return 0
+    command -v gh >/dev/null 2>&1 \
+        || die "填了 RUNS ID 但没装 gh (sudo apt-get install gh, 或留空复用本地 ./out)"
+    REUSE_DIR="$OUT_DIR/reuse-$REUSE_RUN_ID"
+    if [ -d "$REUSE_DIR" ] && [ -n "$(ls -A "$REUSE_DIR" 2>/dev/null)" ]; then
+        log "复用目录已存在, 不重复下载: $REUSE_DIR"
+        return 0
+    fi
+    mkdir -p "$REUSE_DIR"
+    log "从 GitHub Actions Run $REUSE_RUN_ID 下载产物 -> $REUSE_DIR"
+    local -a repoarg=()
+    [ -n "$GH_REPO" ] && repoarg=(-R "$GH_REPO")
+    gh run download "$REUSE_RUN_ID" -D "$REUSE_DIR" ${repoarg[@]+"${repoarg[@]}"} \
+        || die "gh run download $REUSE_RUN_ID 失败 (仓库不对? 用 --repo OWNER/REPO)"
+}
+
+reuse_latest() {
+    # $1 = 文件名通配, $2 = 目标文件名; 找不到就返回 1, 由调用方决定是报错还是跳过
+    local pattern="$1" dest="$2" f
+    # 优先复用 RUNS ID 下下来的, 再退到本地 out/
+    f="$( { [ -n "$REUSE_DIR" ] && [ -d "$REUSE_DIR" ] \
+                && find "$REUSE_DIR" -type f -name "$pattern" -printf '%T@\t%p\n' 2>/dev/null
+            find "$OUT_DIR" -maxdepth 1 -type f -name "$pattern" -printf '%T@\t%p\n' 2>/dev/null
+          } | sort -rn | head -1 | cut -f2- )"
+    if [ -z "$f" ]; then
+        warn "要复用但没有匹配 $pattern 的产物 (找过: ${REUSE_DIR:-<无复用目录>} 和 $OUT_DIR)"
+        return 1
+    fi
+    cp -f "$f" "$OUT_DIR/$dest"
+    log "复用已有产物: $f -> $dest"
+    return 0
+}
+
+pack_boot() {
+    local kernel="$OUT_DIR/Image-$TS.gz" ramdisk="$OUT_DIR/initramfs-$TS.cpio.lz4"
+    [ -f "$kernel" ]  || die "缺内核 $kernel"
+    [ -f "$ramdisk" ] || die "缺 initramfs $ramdisk"
+    log "打包 boot.img (header_version=$HEADER_VERSION, 参数照 postmarketOS wiki)"
+    # DTB 已 objcopy 链进 vmlinux, 所以不传 --dtb, 也不要拼 Image+dtb
+    $MKBOOTIMG_CMD \
+        --kernel "$kernel" \
+        --ramdisk "$ramdisk" \
+        --base $BASE --kernel_offset $KERNEL_OFFSET --pagesize $PAGESIZE \
+        --ramdisk_offset $RAMDISK_OFFSET --tags_offset $TAGS_OFFSET --dtb_offset $DTB_OFFSET \
+        --header_version $HEADER_VERSION --os_version $OS_VERSION --os_patch_level $OS_PATCH_LEVEL \
+        -o "$OUT_DIR/boot-$TS.img"
+    log "boot 镜像: $OUT_DIR/boot-$TS.img"
+}
+
+verify_boot() {
+    if [ -z "$BOT" ]; then
+        warn "找不到 bot-offline.py, 跳过 boot 头部校验"
+        return 0
+    fi
+    python3 "$BOT" --verify-bootimg "$OUT_DIR/boot-$TS.img" \
+        || die "boot.img 头部校验没过, 别刷它"
+}
+
+# --------------------------------------------------------------------------- 主流程
+
+main() {
+    log "项目根目录: $ROOT"
+    log "时间戳: $TS"
+    [ -n "$BOT" ] && log "通知脚本: $BOT" || warn "没找到 bot-offline.py, 构建完不会推送通知"
+
+    check_toolchain
+    ensure_mktools
+    ensure_reuse_run
+    # 不复用的才去拉源码 (已存在就不重复 clone)
+    [ "$BUILD_KERNEL" = "1" ] && ensure_kernel_src
+    [ "$BUILD_INITRAMFS" = "1" ] && ensure_initramfs_src
+
+    if [ "$BUILD_INITRAMFS" = "1" ]; then
+        build_initramfs
+    else
+        reuse_latest "initramfs-*.cpio.lz4" "initramfs-$TS.cpio.lz4" \
+            || die "--no-initramfs 但没东西可复用"
+    fi
+
+    if [ "$BUILD_KERNEL" = "1" ]; then
+        build_kernel
+    else
+        reuse_latest "Image-*.gz" "Image-$TS.gz" \
+            || die "--no-kernel 但没东西可复用"
+    fi
+
+    if [ "$BUILD_KERNEL" = "1" ] && [ "$BUILD_MODULES" = "1" ]; then
+        build_modules
+    else
+        # 复用内核时没法现编模块 (模块必须跟内核同一棵树编译出来)
+        reuse_latest "modules-*.tar.gz" "modules-$TS.tar.gz" \
+            || warn "没有可复用的 modules-*.tar.gz, 本次不产出模块包"
+    fi
+
+    pack_boot
+    verify_boot
+
+    echo "success" > "$STATUS_FILE"
+    {
+        echo "==== 构建产物 ($(date +'%F %T')) ===="
+        ls -lh "$OUT_DIR"/boot-$TS.img "$OUT_DIR"/Image-$TS.gz \
+               "$OUT_DIR"/initramfs-$TS.cpio.lz4 2>/dev/null || true
+    } | tee -a "$LOG_FILE"
+
+    notify success "xaga 主线内核构建完成
+产物: $OUT_DIR
+- boot-$TS.img
+- Image-$TS.gz
+- initramfs-$TS.cpio.lz4
+- modules-$TS.tar.gz
+刷写: fastboot flash boot_a $OUT_DIR/boot-$TS.img (MTK v4 不支持 fastboot boot)"
+
+    log "完成。刷写: fastboot flash boot_a $OUT_DIR/boot-$TS.img"
+}
+
+main "$@"
+
