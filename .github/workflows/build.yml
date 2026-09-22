@@ -654,11 +654,8 @@ jobs:
           else
             apt-get update
             apt-get install -y --no-install-recommends systemd systemd-sysv sudo \
-              openssh-server network-manager wpa-supplicant iproute2 iw wireless-tools \
-              less nano vim htop dialog ca-certificates || true
-            # MediaTek 固件 (README: rootfs 必须补 mediatek 固件, 否则 WiFi/蓝牙/声卡/触控全废)
-            apt-get install -y --no-install-recommends firmware-mediatek \
-              || echo "warn: firmware-mediatek 装不上, 开机后自己补"
+              openssh-server network-manager wpasupplicant iproute2 iw crda \
+              less nano vim htop dialog ca-certificates linux-firmware || true
             [ -n "$EXTRA" ] && apt-get install -y --no-install-recommends $EXTRA || true
             apt-get clean
           fi
@@ -690,26 +687,39 @@ jobs:
             "${ROOTFS_HOSTNAME:-xaga}" "${ROOTFS_PASSWORD:-root}" \
             "${WIFI_SSID:-}" "${WIFI_PASSWORD:-}" "${EXTRA_PKGS:-}" "${ARCH_DESKTOP:-kde}"
           sudo rm -f rootfs/tmp/xaga-setup.sh
-          # === 修复: 可靠卸载伪文件系统 (原实现用 "|| true" 把失败吞掉, 导致 rsync 把宿主机
-          #     /sys /proc /dev 拷进 ext4 镜像 -> Permission denied / No data available -> 退出码 23) ===
-          # 1) 倒序卸载 (dev 是 --rbind, 含 dev/pts dev/shm 等多层挂载, 用 -R 递归)
+          # === 卸载伪文件系统: chroot 里残留进程会堵挂载点, 用 fuser + lazy unmount 兜底 ===
+          # 1) 先杀掉所有可能还占着 rootfs 的进程 (chroot 残留的 dbus / polkitd / sshd 等)
+          if command -v fuser >/dev/null 2>&1; then
+            sudo fuser -km rootfs/proc 2>/dev/null || true
+            sudo fuser -km rootfs/sys   2>/dev/null || true
+            sudo fuser -km rootfs/dev   2>/dev/null || true
+          fi
+          # 2) 倒序 + lazy unmount (-l 不等引用归零, 直接从 /proc/mounts 摘掉, 不再被后续 rsync 看见)
           for m in dev proc sys; do
-            sudo umount -R "rootfs/$m" 2>/dev/null || true
+            sudo umount -l -R "rootfs/$m" 2>/dev/null || sudo umount -R "rootfs/$m" 2>/dev/null || true
           done
-          # 2) 卸载失败兜底: 可能有 chroot 残留进程占着挂载点, 重试几轮
-          for i in 1 2 3; do
+          # 3) 多轮兜底 (lazy umount 也可能因为挂载树太深漏卸, 继续扫)
+          for i in 1 2 3 4 5; do
             if mount | grep -q "$PWD/rootfs"; then
               echo "rootfs 下仍有挂载 (第 ${i} 次重试清理):"
               mount | grep "$PWD/rootfs" || true
-              sleep 5
+              sleep 3
+              if command -v fuser >/dev/null 2>&1; then
+                sudo fuser -km rootfs 2>/dev/null || true
+              fi
               for m in dev proc sys; do
-                sudo umount -R "rootfs/$m" 2>/dev/null || true
+                sudo umount -l -R "rootfs/$m" 2>/dev/null || true
+              done
+              # 极端情况: 直接对每个残留挂载点单独 lazy unmount
+              mount | awk -v p="$PWD/rootfs" '$3 ~ "^"p {print $3}' | while read -r mp; do
+                sudo umount -l "$mp" 2>/dev/null || true
               done
             else
+              echo "伪文件系统已全部卸载 (第 ${i} 轮完成)"
               break
             fi
           done
-          # 3) 最终断言: 还挂着就中止, 绝不带着挂载点进 rsync
+          # 4) 最终断言: 还挂着就中止, 绝不带着挂载点进 rsync
           if mount | grep -q "$PWD/rootfs"; then
             echo "::error::rootfs 下伪文件系统未卸载干净 (umount 失败), 已中止"
             echo "::error::可能原因: chroot 内有进程未退出。可手动排查: mount | grep rootfs"
