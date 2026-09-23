@@ -337,17 +337,50 @@ def save_state(state: dict) -> None:
     log("状态已写入 %s" % os.path.relpath(STATE_FILE, REPO_ROOT))
 
 
+def resolve_upstream_branch(repo: str, hint: str) -> str:
+    """拿上游仓库实际的默认分支, 或确认 hint 分支存在。"""
+    url = "%s/repos/%s" % (API_ROOT, repo)
+    code, body = http_request("GET", url, headers=github_headers())
+    if code == 200:
+        data = json.loads(body)
+        default = data.get("default_branch", hint)
+        if hint and hint != default:
+            h_url = "%s/repos/%s/branches/%s" % (API_ROOT, repo, urllib.parse.quote(hint))
+            h_code, _ = http_request("GET", h_url, headers=github_headers())
+            if h_code == 200:
+                return hint
+            warn("上游 %s 分支 '%s' 不存在, 回退到默认分支 '%s'" % (repo, hint, default))
+        return default
+    if code == 404:
+        die("上游仓库不存在: %s (HTTP 404)" % repo)
+    warn("拿不到上游 %s 的默认分支 (HTTP %s), 直接用 '%s'" % (repo, code, hint))
+    return hint
+
+
 def fetch_upstream_head(repo: str, branch: str) -> dict:
     """取上游分支 HEAD: {sha, subject, date, url}"""
-    url = "%s/repos/%s/commits/%s" % (API_ROOT, repo, urllib.parse.quote(branch))
+    actual_branch = resolve_upstream_branch(repo, branch)
+    url = "%s/repos/%s/commits/%s" % (API_ROOT, repo, urllib.parse.quote(actual_branch))
     code, body = http_request("GET", url, headers=github_headers())
+    if code == 422 and "No commit found" in body:
+        for fb in ("main", "master"):
+            if fb != actual_branch:
+                fb_url = "%s/repos/%s/commits/%s" % (API_ROOT, repo, urllib.parse.quote(fb))
+                fb_code, fb_body = http_request("GET", fb_url, headers=github_headers())
+                if fb_code == 200:
+                    warn("分支 '%s' 不存在, 回退到 '%s'" % (actual_branch, fb))
+                    actual_branch = fb
+                    url = fb_url
+                    body = fb_body
+                    code = 200
+                    break
     if code != 200:
-        die("读取上游 %s@%s 失败 (HTTP %s): %s" % (repo, branch, code, body[:300]))
+        die("读取上游 %s@%s 失败 (HTTP %s): %s" % (repo, actual_branch, code, body[:300]))
     data = json.loads(body)
     commit = data.get("commit", {})
     return {
         "repo": repo,
-        "branch": branch,
+        "branch": actual_branch,
         "sha": data.get("sha", ""),
         "subject": (commit.get("message") or "").splitlines()[0][:120],
         "date": commit.get("committer", {}).get("date", ""),
