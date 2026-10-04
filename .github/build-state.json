@@ -9,11 +9,11 @@
   },
   "kernel": {
     "branch": "7.2-mt6895-xiaomi-xaga",
-    "date": "2026-10-03T17:39:11Z",
+    "date": "2026-10-04T05:23:25Z",
     "repo": "MT6895-Mainline/linux",
-    "sha": "33acfd580f2d54072c16b006dffe954d33a07305",
-    "subject": "media: mediatek: vcodec: add the vendor operation-rate parameter",
-    "url": "https://github.com/MT6895-Mainline/linux/commit/33acfd580f2d54072c16b006dffe954d33a07305"
+    "sha": "e6679a41caba4f2bb10c5596703eb934a42e1750",
+    "subject": "soc: mediatek: dvfsrc: hold a DRAM floor for the VCP encoder",
+    "url": "https://github.com/MT6895-Mainline/linux/commit/e6679a41caba4f2bb10c5596703eb934a42e1750"
   },
-  "updated_at": "2026-10-04 03:11:05 UTC"
+  "updated_at": "2026-10-04 16:04:43 UTC"
 }
