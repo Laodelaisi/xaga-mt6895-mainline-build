@@ -9,11 +9,11 @@
   },
   "kernel": {
     "branch": "7.2-mt6895-xiaomi-xaga",
-    "date": "2026-10-04T05:23:25Z",
+    "date": "2026-10-05T02:20:37Z",
     "repo": "MT6895-Mainline/linux",
-    "sha": "e6679a41caba4f2bb10c5596703eb934a42e1750",
-    "subject": "soc: mediatek: dvfsrc: hold a DRAM floor for the VCP encoder",
-    "url": "https://github.com/MT6895-Mainline/linux/commit/e6679a41caba4f2bb10c5596703eb934a42e1750"
+    "sha": "96d95164a192289390c4852cd8806e9b5e59f7b5",
+    "subject": "media: mediatek: vcodec: allow concurrent VCP decoder sessions",
+    "url": "https://github.com/MT6895-Mainline/linux/commit/96d95164a192289390c4852cd8806e9b5e59f7b5"
   },
-  "updated_at": "2026-10-04 16:04:43 UTC"
+  "updated_at": "2026-10-05 02:45:10 UTC"
 }

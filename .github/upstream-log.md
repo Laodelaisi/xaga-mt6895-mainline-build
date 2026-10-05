@@ -8,3 +8,4 @@ bot.py 每次检测到上游新 commit 时追加。
 - 2026-10-03 15:19 MT6895-Mainline/linux@7.2-mt6895-xiaomi-xaga -> fd8eba73fc43 (2026-10-03T08:06:15Z) drm/mediatek: map generic planes to real OVL layers for the hardware cursor
 - 2026-10-04 03:11 MT6895-Mainline/linux@7.2-mt6895-xiaomi-xaga -> 33acfd580f2d (2026-10-03T17:39:11Z) media: mediatek: vcodec: add the vendor operation-rate parameter
 - 2026-10-04 16:04 MT6895-Mainline/linux@7.2-mt6895-xiaomi-xaga -> e6679a41caba (2026-10-04T05:23:25Z) soc: mediatek: dvfsrc: hold a DRAM floor for the VCP encoder
+- 2026-10-05 02:45 MT6895-Mainline/linux@7.2-mt6895-xiaomi-xaga -> 96d95164a192 (2026-10-05T02:20:37Z) media: mediatek: vcodec: allow concurrent VCP decoder sessions
