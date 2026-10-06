@@ -9,11 +9,11 @@
   },
   "kernel": {
     "branch": "7.2-mt6895-xiaomi-xaga",
-    "date": "2026-10-05T02:20:37Z",
+    "date": "2026-10-05T04:11:43Z",
     "repo": "MT6895-Mainline/linux",
-    "sha": "96d95164a192289390c4852cd8806e9b5e59f7b5",
-    "subject": "media: mediatek: vcodec: allow concurrent VCP decoder sessions",
-    "url": "https://github.com/MT6895-Mainline/linux/commit/96d95164a192289390c4852cd8806e9b5e59f7b5"
+    "sha": "0ec065a60dc8909205cab3d31df6797d89aa44a2",
+    "subject": "media: mediatek: vcodec: size the VDEC OPP from a declared decode rate",
+    "url": "https://github.com/MT6895-Mainline/linux/commit/0ec065a60dc8909205cab3d31df6797d89aa44a2"
   },
-  "updated_at": "2026-10-05 02:45:10 UTC"
+  "updated_at": "2026-10-06 03:36:50 UTC"
 }
