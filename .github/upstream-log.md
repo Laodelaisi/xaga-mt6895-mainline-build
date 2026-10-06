@@ -10,3 +10,4 @@ bot.py 每次检测到上游新 commit 时追加。
 - 2026-10-04 16:04 MT6895-Mainline/linux@7.2-mt6895-xiaomi-xaga -> e6679a41caba (2026-10-04T05:23:25Z) soc: mediatek: dvfsrc: hold a DRAM floor for the VCP encoder
 - 2026-10-05 02:45 MT6895-Mainline/linux@7.2-mt6895-xiaomi-xaga -> 96d95164a192 (2026-10-05T02:20:37Z) media: mediatek: vcodec: allow concurrent VCP decoder sessions
 - 2026-10-06 03:36 MT6895-Mainline/linux@7.2-mt6895-xiaomi-xaga -> 0ec065a60dc8 (2026-10-05T04:11:43Z) media: mediatek: vcodec: size the VDEC OPP from a declared decode rate
+- 2026-10-06 17:31 MT6895-Mainline/linux@7.2-mt6895-xiaomi-xaga -> 3ab4554daaed (2026-10-06T14:27:20Z) media: mediatek: vcodec: default the VDEC OPP from a resolution op-rate table
