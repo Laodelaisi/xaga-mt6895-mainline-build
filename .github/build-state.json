@@ -9,11 +9,11 @@
   },
   "kernel": {
     "branch": "7.2-mt6895-xiaomi-xaga",
-    "date": "2026-10-06T14:27:20Z",
+    "date": "2026-10-07T08:21:15Z",
     "repo": "MT6895-Mainline/linux",
-    "sha": "3ab4554daaed6849c46f2f9ffd1f344ca1689c05",
-    "subject": "media: mediatek: vcodec: default the VDEC OPP from a resolution op-rate table",
-    "url": "https://github.com/MT6895-Mainline/linux/commit/3ab4554daaed6849c46f2f9ffd1f344ca1689c05"
+    "sha": "25418005f50b108969d2f65f671fd71c021ee8ad",
+    "subject": "media: mediatek: vcodec: decode straight into the client's CAPTURE buffer",
+    "url": "https://github.com/MT6895-Mainline/linux/commit/25418005f50b108969d2f65f671fd71c021ee8ad"
   },
-  "updated_at": "2026-10-06 17:31:24 UTC"
+  "updated_at": "2026-10-07 18:03:21 UTC"
 }
